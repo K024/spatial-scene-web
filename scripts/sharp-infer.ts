@@ -1,17 +1,20 @@
 /**
  * 跑一次 SHARP 推理并导出 PLY（node 侧，供 SuperSplat 查看）。
  *
+ * 阶段：**SHARP 离线管线**（`scripts/sharp-*`：推理 / 导出 / 自检）。
+ *
  * 用法：
- *   npx tsx scripts/infer-ply.ts                    # 默认 DML + fp16 模型
- *   npx tsx scripts/infer-ply.ts --ep webgpu        # 实验性 WebGPU EP
- *   npx tsx scripts/infer-ply.ts --full             # 追加 ml-sharp 元数据 element
- *   npx tsx scripts/infer-ply.ts --crop 0,0,545,748 # 从拼图里裁一张（teaser 图用）
- *   npx tsx scripts/infer-ply.ts --image X.jpg --out out.ply
+ *   npx tsx scripts/sharp-infer.ts                    # 默认 DML + fp16 模型
+ *   npx tsx scripts/sharp-infer.ts --ep webgpu        # 实验性 WebGPU EP
+ *   npx tsx scripts/sharp-infer.ts --full             # 追加 ml-sharp 元数据 element
+ *   npx tsx scripts/sharp-infer.ts --crop 0,0,545,748 # 从拼图里裁一张（teaser 图用）
+ *   npx tsx scripts/sharp-infer.ts --image X.jpg --out out.ply
  *
  * 除 `.ply` 外还会写一个同名 `.camera.json`：SuperSplat 的相机位姿格式
  * （INRIA `cameras.json`）。把两个文件**一起**拖进 https://superspl.at/editor，
  * 相机就会跳到拍摄时的精确视角（见 `src/spatial-scene/export/camera.ts` 的坐标系说明）。
- * 离线核对这个视角下画面是否与输入图对齐：`npx tsx scripts/check-camera.ts`。
+ * 离线核对相机参数自洽性：`npx tsx scripts/sharp-check-camera.ts`（只核对参数，不渲染）；
+ * 「渲染结果与原图对齐」的证据由 wsplat 通路给出：`npx tsx scripts/wsplat-golden.ts --compare-image`。
  *
  * 环境变量：
  *   SHARP_EP      覆盖执行提供者（逗号分隔的候选链）
@@ -209,7 +212,8 @@ async function main(): Promise<void> {
       "SuperSplat 把 fov 作用在视口较长的轴上。",
   )
   console.log(
-    "      离线核对（无需浏览器/GPU）：npx tsx scripts/check-camera.ts",
+    "      相机参数核对：npx tsx scripts/sharp-check-camera.ts",
+    "      渲染对齐核对：npx tsx scripts/wsplat-golden.ts --compare-image",
   )
   if (full) {
     console.log(

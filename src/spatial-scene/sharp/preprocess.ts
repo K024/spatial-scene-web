@@ -82,7 +82,7 @@ function bilinearSample(
  * 对 CHW 展平的 float32 图像做双线性缩放（`align_corners=True`）。
  *
  * 这是 `preprocessImage` 内部用的同一段数学，单独导出供数值验证使用
- * （见 `scripts/compare-fixtures.ts` 阶段 1a：用确定性合成图与
+ * （见 `scripts/sharp-compare-fixtures.ts` 阶段 1a：用确定性合成图与
  * `F.interpolate(align_corners=True)` 对拍，隔离掉 JPEG 解码器差异）。
  *
  * @param src CHW 展平源像素，长度 `channels*srcW*srcH`。

@@ -1,13 +1,15 @@
 /**
  * 单元级自检：验证 `sharp/` 与 `export/` 的数值实现。
  *
+ * 阶段：**SHARP 离线管线**（`scripts/sharp-*`：推理 / 导出 / 自检）。
+ *
  * 这些测试不依赖 ort，也不需要模型文件，纯数学核对。
  * 覆盖三处最容易出 bias 的地方：
  *   1. NDC -> metric 反投影矩阵（对照 predict.py 的构造）
  *   2. 协方差 compose/decompose 往返一致性
  *   3. PLY 颜色编码：linearRGB -> sRGB -> SH 的可逆性与已知值
  *
- * 用法：npx tsx scripts/test-sharp.ts
+ * 用法：npx tsx scripts/sharp-test.ts
  */
 
 import {

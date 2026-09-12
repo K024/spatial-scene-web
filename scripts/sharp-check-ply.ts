@@ -1,11 +1,13 @@
 /**
  * PLY 读回校验（node 侧）。
  *
+ * 阶段：**SHARP 离线管线**（`scripts/sharp-*`：推理 / 导出 / 自检）。
+ *
  * 用途：验证导出的 PLY 能被正确解析，并检查数值是否合理。
  * 这是对 `export/ply.ts` 的自检——不依赖外部工具，
  * 避免「文件写坏了但没人发现」。
  *
- * 用法：npx tsx scripts/check-ply.ts [path]
+ * 用法：npx tsx scripts/sharp-check-ply.ts [path]
  */
 
 import { readFileSync } from "node:fs"

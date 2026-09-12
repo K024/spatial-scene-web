@@ -27,7 +27,8 @@
  *
  * 结论：对单图推理（extrinsics = I），位姿就是 `position=[0,0,0]`、`rotation=I`，
  * 朝向 +z；再用原始 `f_px` 与原始图像尺寸给出 fov。渲染出的画面应当与输入图逐像素对齐
- * （见 `scripts/check-camera.ts` 的离线渲染校验）。
+ * `scripts/sharp-check-camera.ts` 核对本 json 的位姿/内参与 wsplat 相机模块是否自洽；
+ * 画面级对齐证据见 `scripts/wsplat-golden.ts --compare-image`。
  */
 
 /** `[x, y, z]`。 */

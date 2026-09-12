@@ -1,6 +1,8 @@
 /**
  * JS 实现 vs PyTorch fixtures 的数值对拍。
  *
+ * 阶段：**SHARP 离线管线**（`scripts/sharp-*`：推理 / 导出 / 自检）。
+ *
  * 这是唯一能证明 JS 侧数值正确的手段（而非目视看 PLY）。
  * 对拍分阶段进行，逐层定位误差来源：
  *
@@ -13,8 +15,8 @@
  * 这正是我们最需要验证的部分（反投影 + 协方差重分解）。
  *
  * 用法:
- *   npx tsx scripts/compare-fixtures.ts             # 全部阶段（阶段 2 需要模型）
- *   npx tsx scripts/compare-fixtures.ts --no-infer  # 跳过 ONNX 推理（纯 JS，秒级）
+ *   npx tsx scripts/sharp-compare-fixtures.ts             # 全部阶段（阶段 2 需要模型）
+ *   npx tsx scripts/sharp-compare-fixtures.ts --no-infer  # 跳过 ONNX 推理（纯 JS，秒级）
  */
 
 import { readFileSync } from "node:fs"
@@ -209,7 +211,7 @@ async function main(): Promise<void> {
     // 1a. resize 正确性：用同一个源（fixture 里已存不下原图，改用合成图）
     //     这里用 sharp 解码后的像素当源，喂给 preprocessImage 与 torch 对比是做不到的
     //     （torch fixture 用的是 PIL 解码），所以改为：报告差异分布，
-    //     并单独验证 resize 数学（见 scripts/test-sharp.ts 的 bilinear 用例）。
+    //     并单独验证 resize 数学（见 scripts/sharp-test.ts 的 bilinear 用例）。
     const s = stats(jsImg, refImg)
     console.log(
       `    info  preprocessImage    maxErr=${s.maxAbsErr.toExponential(3)} ` +
