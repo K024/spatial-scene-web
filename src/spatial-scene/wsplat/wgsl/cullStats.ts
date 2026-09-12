@@ -18,6 +18,13 @@
  * - `countOnce*` 只在定义了 `SPLAT_COUNT_CULLS` 时才真的原子加
  *   （见 `splatData.ts`），因此同一份 chunk 在顶点模块里是零开销。
  *
+ * ── 为什么要单独一个 `layerRange` uniform ──
+ * 光栅化那趟靠 `draw(6, count, 0, base)` 切区间，顶点阶段拿到的是全局实例号，
+ * 所以 `SplatUniforms`（与顶点模块**共用**的那张表）不需要知道区间。
+ * 但 compute 没有 `firstInstance` 这个东西，只能从 uniform 读。
+ * 所以区间放在**本 chunk 自己的** binding 上：共用表保持最小，
+ * 也不会因为“多了一个只有 compute 才用的字段”而让顶点模块的 layout 跟着变。
+ *
  * 代价：多一趟 O(n) 的顶点前处理（实测 native 1.18M 高斯约 ms 量级），
  * 且**只有显式调用 `countCulls()` 才跑**——不需要统计时零成本。
  */
@@ -32,10 +39,28 @@ export const cullStatsWgsl = {
 #include "gsplatCorner"
 #include "gsplatCommon"
 
+/**
+ * 本趟统计的排列区间。
+ *
+ * 写成**具名 struct**（不是裸 vec4u）：createUniformSlot 用的是
+ * webgpu-utils 的 makeStructuredView，其余三个 uniform 也都是 struct，
+ * 裸类型下 view.set({...}) 会静默不生效（表现为剔除统计全 0，不报错）。
+ */
+struct LayerRange {
+	// 排列里的起始下标：本趟只统计 [offset, offset + count)
+	offset: u32,
+	count: u32,
+	// 补到 16 字节对齐
+	padding0: u32,
+	padding1: u32,
+}
+
+@group(0) @binding(5) var<uniform> layerRange: LayerRange;
+
 @compute @workgroup_size(64)
 fn csCountCulls(@builtin(global_invocation_id) gid: vec3u) {
-	let index: u32 = gid.x;
-	if (index >= uniforms.numSplats) {
+	let index: u32 = gid.x + layerRange.offset;
+	if (index >= layerRange.offset + layerRange.count) {
 		return;
 	}
 

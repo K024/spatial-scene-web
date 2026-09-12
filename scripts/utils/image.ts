@@ -49,6 +49,75 @@ type SharpFactory = (input: string | Buffer) => SharpInstance
 
 const sharp = require("sharp") as SharpFactory
 
+/**
+ * 导出脚本用的最小 sharp 管线接口。
+ *
+ * 放这里（而不是让每个脚本各自 `createRequire`）是为了让「写 PNG」只有一份实现 ——
+ * 之前 `wsplat-render.ts` 与 `wsplat-check-blit.ts` 各抄了一份 `sharpFromRgba`。
+ */
+export interface SharpPipeline {
+  composite(
+    items: readonly { input: Buffer; left: number; top: number }[],
+  ): SharpPipeline
+  resize(opts: {
+    width?: number
+    height?: number
+    kernel?: string
+  }): SharpPipeline
+  png(): SharpPipeline
+  toBuffer(): Promise<Buffer>
+  toFile(path: string): Promise<unknown>
+}
+
+/** RGBA8 裸像素 -> sharp 管线（可 `.png().toFile(...)`）。 */
+export function sharpFromRgba(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+): SharpPipeline {
+  const factory = require("sharp") as (
+    input: Buffer,
+    opts: { raw: { width: number; height: number; channels: number } },
+  ) => SharpPipeline
+  return factory(Buffer.from(rgba.buffer, rgba.byteOffset, rgba.byteLength), {
+    raw: { width, height, channels: 4 },
+  })
+}
+
+/** 建一张纯色画布（拼图用）。 */
+export function createSharpCanvas(
+  width: number,
+  height: number,
+  rgba: readonly [number, number, number, number] = [0, 0, 0, 255],
+): SharpPipeline {
+  const factory = require("sharp") as (opts: {
+    create: {
+      width: number
+      height: number
+      channels: number
+      background: { r: number; g: number; b: number; alpha: number }
+    }
+  }) => SharpPipeline
+  const [r, g, b, a] = rgba
+  return factory({
+    create: {
+      width,
+      height,
+      channels: 4,
+      background: { r, g, b, alpha: a / 255 },
+    },
+  })
+}
+
+/** RGBA8 -> PNG Buffer（不落盘，供拼接）。 */
+export async function rgbaToPngBuffer(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+): Promise<Buffer> {
+  return sharpFromRgba(rgba, width, height).png().toBuffer()
+}
+
 /** 已加载的图像 + 元数据。 */
 export interface LoadedImage {
   /** HWC RGB uint8 像素。 */

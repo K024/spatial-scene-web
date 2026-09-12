@@ -18,6 +18,14 @@ fn cornerUv(vertexIndex: u32) -> vec2f {
 }
 
 fn initSource(source: ptr<function, SplatSource>, instanceIndex: u32, vertexIndex: u32) -> bool {
+	// instanceIndex 是**排列里的位置**（= firstInstance + i），不是高斯下标。
+	//
+	// 为什么只用 numSplats 当上界就够（不要加别的字段）——
+	// 排列是全部高斯的**严格排列**（分层是硬划分，不重不漏），
+	// 所以对任意子区间 [base, base+count) 都有 orderIndex < numSplats，
+	// 且 splatOrder[orderIndex] < numSplats 必然成立。
+	// 余下的区间裁剪全在 draw() 的 firstInstance / instanceCount 里，
+	// 顶点阶段不需要知道“本趟是哪一层”，也就没有新的 uniform。
 	let orderIndex: u32 = instanceIndex;
 	if (orderIndex >= uniforms.numSplats) {
 		return false;

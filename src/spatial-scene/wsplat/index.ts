@@ -21,11 +21,22 @@
  * **准确度优先，性能次要**：允许慢；精度上不做 f16 加速取舍；排序正确性优先。
  * 耗时只作为观测值记录在脚本输出里，不是验收目标。
  *
- * ── 逐层渲染（LDI）怎么用 ──
- * 层 = 全局 back-to-front 排序的一段**连续区间**，每层的渲染就是：
+ * ── 逐层渲染（LDI）怎么用：排列的所有权在调用方 ──
+ * 渲染器只认一张**排列** `splatOrder: instanceIndex -> splatIndex`，不关心它的语义。
+ * 「哪个高斯属于哪一层」是 layering 的事，所以它也只在那里维护一张**层表**
+ * `{base, count}[L]` 指向排列里的连续段：
  * ```
- * setGaussians(第 k 段) -> setCamera(camera) -> sort() -> renderSplats()   // 内部 clear
+ * setGaussians(全部) -> setCamera(camera) -> setSplatOrder(按层分组的排列)
+ * for k in 远..近: drawLayer(table[k])   // 内部 clear
  * ```
+ * 为什么排列归调用方，而不是「层 = 全局排序的一段区间」：
+ * - 层间重叠（`rangeOverlap`）与密度补偿（densify）会让同一个高斯出现在**多个层**，
+ *   那时排列长度 > 高斯数，区间方案要么重传要么重排；
+ * - 非深度分带的层（语义 / 物体 / 前景区块）在全局深度排序里**根本不连续**，
+ *   区间方案表达不了。
+ * 代价："各段之并 = 全表且有序" 从自动变成需要证明，所以 layering 侧必须把它当成
+ * 一条门来验（排列合法 + 每层内部有序 + 层序还→近）。
+ *
  * 因为 `over` 是**结合的**，逐段渲染再按序合成与一次画完恒等；又因为每层各自 clear，
  * 所以**层间顺序无关**（每层的颜色/alpha/ED 都只反映本层，不被更近的层衰减）——
  * 这正是视差渲染要的 LDI 语义：每层持有自己原本的颜色。跨层合并深度必须在
@@ -241,23 +252,65 @@ export interface WSplatRenderer {
   /** 设置相机（只写 uniform，不重排）。 */
   setCamera(camera: WSplatCamera): void
   /**
-   * 按当前相机重排 splat（CPU 确定性 radix，back-to-front）。
+   * 按当前相机重算排列（CPU 确定性 radix，back-to-front），写进 order buffer。
    *
-   * 相机不动时可以不调：结果一致，只是顺序沿用上一次。
+   * 相机不动时可以不调：结果一致，只是排列沿用上一次。
+   *
+   * ⚠ 分层路径**不要**用它：它会用全局 back-to-front 覆盖掉按层分组的排列。
+   * 分层应该自己算 `computeViewDepths` + `sortSplatsBackToFront`，再合并成
+   * 按层分组的排列，最后一次性 `setSplatOrder()`。
    */
   sort(camera?: WSplatCamera): void
   /**
-   * 画一帧 splat，`draw(6, numSplats)`，vertex pulling。
+   * 画一帧 splat，`draw(6, 排列长度)`，vertex pulling。
    *
    * @param options.clear `true`（默认）时同时清空两个累加附件；
    *   多次 draw 叠加（将来的 depth peeling）时传 `false`。
-   *
-   * 顶点阶段读的 `instance_index` **就是排序后的下标**（`splatOrder[instance_index]`），
-   * 所以切一段渲染只需要调 draw 的 `firstInstance` / `instanceCount`，WGSL 不用改。
-   * 另外每个实例只读自己的下标，**没有按总数做的归一化/统计**，
-   * 所以子集渲染与全量渲染数学一致（见文件头「逐层渲染（LDI）怎么用」）。
    */
   renderSplats(options?: { clear?: boolean }): void
+  /**
+   * 只画**排列**里的一段连续区间 `[firstInstance, firstInstance + instanceCount)`。
+   *
+   * 这是「逐层渲染（LDI）」的最低层原语：`over` 可结合，所以只要排列本身是
+   * 合法的绘制顺序（层间还→近、层内 back-to-front），切一段渲染与「在全集里
+   * 渲染这段」**数学恒等**。顶点阶段读的 `instance_index` 就是排列里的位置，
+   * 于是只需要 draw 的 `firstInstance` / `instanceCount`。
+   *
+   * 因为每层各自 `clear`，层间顺序无关 —— 这正是 LDI 要的语义：每层持有自己原本的颜色。
+   *
+   * ⚠ 区间会被记下来，供随后的 `countCulls()` / `readSplatStats()` 统计**同一段**
+   *（否则「这一层被静默剔空了」会被全场统计淹没，完全看不出来）。
+   *
+   * ⚠ 这是**区间**原语：它假设层是排列里的一段。「层是任意下标集合」请用 `drawLayer()`
+   * —— 那时候该由调用方把层排成排列里的连续段（layering 的层表就是这样做的）。
+   */
+  renderSplatsRange(options: {
+    firstInstance: number
+    instanceCount: number
+    clear?: boolean
+  }): void
+  /**
+   * 换掉整个**排列**：`instanceIndex -> splatIndex`（见 `WSplatGpuData.uploadOrder`）。
+   *
+   * 排列的所有权归调用方（layering）：它才是知道「哪一段属于哪一层」的一方。
+   * 渲染器只保证「按你给的顺序画」。
+   *
+   * 长度可以 `<=` orderCapacity 的任意值，也可以 `> count`（重叠 / 密度补偿）。
+   * 换完之后 `renderSplats()` 画的是整张排列表。
+   */
+  setSplatOrder(order: Uint32Array, length?: number): void
+  /** 当前排列长度。 */
+  readonly permutationLength: number
+  /**
+   * 画一层：`table[k] = { base, count }` 指向排列里的一段（layering 的层表）。
+   *
+   * 就是 `renderSplatsRange({ firstInstance: base, instanceCount: count })`，
+   * 但把「层表」这个概念放到 API 上，调用方就不需要自己维护 `base = Σcount`。
+   */
+  drawLayer(
+    layer: { readonly base: number; readonly count: number },
+    options?: { clear?: boolean },
+  ): void
   /** 把预览纹理送进目标视图（画布）；格式须已在 `options.presentFormat` 里给出。 */
   encodePresent(
     encoder: GPUCommandEncoder,
@@ -315,6 +368,20 @@ class Renderer implements WSplatRenderer {
   private blitUniforms!: UniformSlot
   private resolveUniforms!: UniformSlot
   private splatUniforms!: UniformSlot
+  /**
+   * 本趟绘制的排列区间。
+   *
+   * **纯 CPU 记账**，不写进顶点 uniform：
+   * - 光栅化那趟靠 `draw(6, count, 0, base)` 切区间，顶点阶段自己就能从
+   *   `@builtin(instance_index)` 拿到全局实例号，**不需要**这两个数
+   *   （所以 `SplatUniforms` 不必变形）；
+   * - 但 `countCulls()` 要它们决定 dispatch 多少个 workgroup，
+   *   `readSplatStats().total` 也要它 —— compute 没有 `firstInstance`。
+   */
+  private instanceOffset = 0
+  private instanceCount = 0
+  /** 当前排列长度（可 > 高斯数：重叠 / 加密）。 */
+  private permutationLengthValue = 0
   private blitBindGroup!: GPUBindGroup
   private resolveBindGroup!: GPUBindGroup
   private splatBindGroup!: GPUBindGroup
@@ -324,6 +391,14 @@ class Renderer implements WSplatRenderer {
   private cullStatsPipeline!: GPUComputePipeline
   private cullStatsLayout!: GPUBindGroupLayout
   private cullStatsBindGroup!: GPUBindGroup
+  /**
+   * 剔除统计那趟的区间 `(firstInstance, instanceCount, 0, 0)`。
+   *
+   * 单独开一个 uniform，而不是塞进 `SplatUniforms`：光栅化那趟靠
+   * `draw(6, count, 0, base)` 切区间，顶点阶段根本不读它；
+   * 共用表保持最小 = 分层不需要动顶点 pipeline 的 uniform 布局。
+   */
+  private cullRangeUniforms!: UniformSlot
 
   private gpuData: WSplatGpuData | undefined
   private camera: WSplatCamera | undefined
@@ -415,11 +490,12 @@ class Renderer implements WSplatRenderer {
   ): void {
     this.gpuData?.destroy()
     const data = createWSplatGpuData(this.device, gaussians, options)
-    // 初始顺序 = 原顺序（先不排序；`sort()` 会覆盖它）
+    // 初始排列 = 原顺序（先不排序；`sort()` / `setSplatOrder()` 会覆盖它）
     const identity = new Uint32Array(data.count)
     for (let i = 0; i < data.count; i++) identity[i] = i
     data.uploadOrder(identity)
     this.gpuData = data
+    this.setFullRange(data.orderLength)
     if (this.camera) this.writeSplatUniforms()
     this.splatBindGroup = this.device.createBindGroup({
       label: "splat",
@@ -447,6 +523,10 @@ class Renderer implements WSplatRenderer {
         { binding: 2, resource: { buffer: data.geometry } },
         { binding: 3, resource: { buffer: data.order } },
         { binding: 4, resource: { buffer: this.splatStatsBuffer } },
+        {
+          binding: this.cullRangeUniforms.binding,
+          resource: { buffer: this.cullRangeUniforms.buffer },
+        },
       ],
     })
   }
@@ -470,11 +550,83 @@ class Renderer implements WSplatRenderer {
     }
   }
 
+  get permutationLength(): number {
+    return this.permutationLengthValue
+  }
+
+  setSplatOrder(order: Uint32Array, length?: number): void {
+    const data = this.gpuData
+    if (!data) throw new Error("setGaussians() 之前不能 setSplatOrder()")
+    data.uploadOrder(order, length)
+    this.setFullRange(data.orderLength)
+    this.writeSplatUniforms()
+  }
+
+  /** 把本趟区间设成「整张排列」。 */
+  private setFullRange(length: number): void {
+    this.permutationLengthValue = length
+    this.instanceOffset = 0
+    this.instanceCount = length
+  }
+
+  /**
+   * 把本趟区间写进**剔除统计自己的** uniform（顶点那趟不读它）。
+   *
+   * 由 `countCulls()` 自己写，而不是由 `renderSplatsRange()` 写：
+   * 区间唯一的消费者就是剔除统计，这样就不用假设调用顺序。
+   */
+  private writeCullRange(firstInstance: number, instanceCount: number): void {
+    this.cullRangeUniforms.view.set({
+      offset: firstInstance,
+      count: instanceCount,
+    })
+    this.cullRangeUniforms.upload()
+  }
+
   renderSplats(options: { clear?: boolean } = {}): void {
+    this.renderSplatsRange({
+      firstInstance: 0,
+      instanceCount: this.permutationLengthValue,
+      clear: options.clear,
+    })
+  }
+
+  drawLayer(
+    layer: { readonly base: number; readonly count: number },
+    options: { clear?: boolean } = {},
+  ): void {
+    this.renderSplatsRange({
+      firstInstance: layer.base,
+      instanceCount: layer.count,
+      clear: options.clear,
+    })
+  }
+
+  renderSplatsRange(options: {
+    firstInstance: number
+    instanceCount: number
+    clear?: boolean
+  }): void {
     const data = this.gpuData
     if (!data) throw new Error("setGaussians() 之前不能 renderSplats()")
     if (!this.camera) throw new Error("setCamera() 之前不能 renderSplats()")
     const clear = options.clear ?? true
+    const firstInstance = Math.max(0, Math.floor(options.firstInstance))
+    const instanceCount = Math.max(
+      0,
+      Math.min(
+        Math.floor(options.instanceCount),
+        this.permutationLengthValue - firstInstance,
+      ),
+    )
+    if (firstInstance + instanceCount > data.orderCapacity) {
+      throw new Error(
+        `绘制区间 [${firstInstance}, ${firstInstance + instanceCount}) 超过排列容量 ${data.orderCapacity}`,
+      )
+    }
+    this.instanceOffset = firstInstance
+    this.instanceCount = instanceCount
+    this.writeSplatUniforms()
 
     const encoder = this.device.createCommandEncoder({ label: "wsplat:splat" })
     const pass = encoder.beginRenderPass({
@@ -496,8 +648,9 @@ class Renderer implements WSplatRenderer {
     })
     pass.setPipeline(this.splatPipeline)
     pass.setBindGroup(0, this.splatBindGroup)
-    // 每个 splat 6 个顶点（两个三角形），实例数 = 高斯数量
-    pass.draw(6, data.count)
+    // 每个 splat 6 个顶点（两个三角形），实例数 = 本趟区间长度，
+    // 起始实例号 = 排序序列里的偏移（顶点阶段直接拿它当排序下标）。
+    pass.draw(6, instanceCount, 0, firstInstance)
     pass.end()
     this.device.queue.submit([encoder.finish()])
   }
@@ -618,6 +771,8 @@ class Renderer implements WSplatRenderer {
   countCulls(): void {
     if (!this.gpuData) throw new Error("setGaussians() 之前不能 countCulls()")
     if (!this.camera) throw new Error("setCamera() 之前不能 countCulls()")
+    // 区间的唯一消费者是本趟统计，所以在这里写，不依赖调用顺序
+    this.writeCullRange(this.instanceOffset, this.instanceCount)
     // 每次从 0 开始
     this.device.queue.writeBuffer(
       this.splatStatsBuffer,
@@ -630,7 +785,7 @@ class Renderer implements WSplatRenderer {
     const pass = encoder.beginComputePass({ label: "wsplat:cullStats" })
     pass.setPipeline(this.cullStatsPipeline)
     pass.setBindGroup(0, this.cullStatsBindGroup)
-    pass.dispatchWorkgroups(Math.ceil(this.gpuData.count / 64))
+    pass.dispatchWorkgroups(Math.ceil(this.instanceCount / 64))
     pass.end()
     this.device.queue.submit([encoder.finish()])
   }
@@ -643,7 +798,7 @@ class Renderer implements WSplatRenderer {
       { label: "wsplat:splatStats" },
     )
     return {
-      total: this.gpuData?.count ?? 0,
+      total: this.instanceCount,
       drawn: raw[0],
       culledBounds: raw[1],
       culledAlphaClip: raw[2],
@@ -809,6 +964,7 @@ class Renderer implements WSplatRenderer {
       })
       const module = createShaderModule(device, code, "cullStats")
       const defs = parseDefs(code)
+      this.cullRangeUniforms = createUniformSlot(device, defs, "layerRange")
       const layouts = createBindGroupLayouts(
         device,
         defs,

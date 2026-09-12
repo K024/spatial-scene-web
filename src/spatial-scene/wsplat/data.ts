@@ -30,12 +30,32 @@ export interface WSplatGpuData {
   readonly rgba: GPUBuffer
   /** `array<f32>`：每 splat `GEOMETRY_STRIDE` 个。 */
   readonly geometry: GPUBuffer
-  /** `array<u32>`：排序后的 splat 下标（back-to-front），见 `sort.ts`。 */
+  /** `array<u32>`：**排列**（见 `uploadOrder`）。 */
   readonly order: GPUBuffer
+  /** order buffer 能装多少个下标（= `count`）。 */
+  readonly orderCapacity: number
+  /** 当前排列的长度（由 `uploadOrder` 决定，恒等于 `count`）。 */
+  orderLength: number
   /** 均值（世界坐标）的 CPU 副本，`[N,3]`；排序算深度用，不需要回落 GPU。 */
   readonly means: Float32Array
-  /** 覆盖排序索引（长度必须等于 `count`）。 */
-  uploadOrder(order: Uint32Array): void
+  /**
+   * 覆盖排列。
+   *
+   * ── 这里装的一定是「全量下标的一个排列」──
+   * 它是一张**下标表**：`instanceIndex -> splatIndex`。
+   * - 全量渲染时它是 back-to-front 的排序索引；
+   * - 分层时它是**按层分组**的排列（层间远→近、层内 back-to-front），
+   *   因为 `over` 可结合，这样的排列仍然是合法的绘制顺序。
+   *
+   * 两种情况下它都是 `[0, count)` 的**严格排列**（长度 `== count`、不重不漏）：
+   * 分层是**硬划分**（`over` 不幂等，同一个高斯不能进两层），
+   * 而 `rangeOverlap` / 密度补偿都**不会**复制高斯，所以长度不会超过 `count`。
+   * 这条不变量在 `uploadOrder` 里直接断言 —— 一旦破了，
+   * 顶点阶段的 `orderIndex < numSplats` 就不再是安全的边界。
+   *
+   * 「哪一段属于哪一层」是调用方的事（层表 `{base,count}` 在 layering 侧）。
+   */
+  uploadOrder(order: Uint32Array, length?: number): void
   destroy(): void
 }
 
@@ -46,6 +66,13 @@ export interface CreateWSplatGpuDataOptions {
    * 所以默认 `"linearRGB"`；只有在直接喂 PLY 解码结果时才可能传 `"sRGB"`。
    */
   colorSpace?: "linearRGB" | "sRGB"
+  /**
+   * order buffer 的容量（下标个数）。默认并**应当**是 `count`。
+   *
+   * 不要留余量：排列是严格排列（见 `uploadOrder`），容量大于 `count` 只会
+   * 掩盖「长度超过高斯数」这个应当直接报错的状态。
+   */
+  orderCapacity?: number
 }
 
 /** 把 `sRGB` 分量转成线性（阈值分段，与 `sharp/colorspace.ts` 同式）。 */
@@ -119,23 +146,35 @@ export function createWSplatGpuData(
   })
   device.queue.writeBuffer(geometryBuffer, 0, geometry)
 
+  const orderCapacity = Math.max(
+    count,
+    Math.floor(options.orderCapacity ?? count),
+  )
   const orderBuffer = device.createBuffer({
     label: "wsplat:splatOrder",
-    size: count * 4,
+    size: orderCapacity * 4,
     usage,
   })
 
-  return {
+  const data: WSplatGpuData = {
     count,
     rgba: rgbaBuffer,
     geometry: geometryBuffer,
     order: orderBuffer,
+    orderCapacity,
+    orderLength: 0,
     means: meanVectors,
-    uploadOrder(order: Uint32Array): void {
-      if (order.length !== count) {
-        throw new Error(`排序索引长度 ${order.length} != 高斯数量 ${count}`)
+    uploadOrder(order: Uint32Array, length?: number): void {
+      const n = length ?? order.length
+      if (n !== count || order.length < count) {
+        throw new Error(
+          `排列必须是全部 ${count} 个高斯的严格排列（收到 length ${n}，` +
+            `数组长度 ${order.length}）—— 分层是硬划分，` +
+            "同一个高斯不允许出现在两层（`over` 不幂等）",
+        )
       }
-      device.queue.writeBuffer(orderBuffer, 0, order)
+      device.queue.writeBuffer(orderBuffer, 0, order, 0, count)
+      data.orderLength = count
     },
     destroy(): void {
       rgbaBuffer.destroy()
@@ -143,6 +182,7 @@ export function createWSplatGpuData(
       orderBuffer.destroy()
     },
   }
+  return data
 }
 
 function expectLength(

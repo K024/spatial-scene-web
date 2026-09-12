@@ -23,6 +23,7 @@ struct SplatUniforms {
 	// (width, height, 1/width, 1/height) —— 与上游同名同义
 	viewport_size: vec4f,
 	minPixelSize: f32,
+	// **数据**里有多少个高斯（storage buffer 的边界）
 	numSplats: u32,
 	alphaClipForward: f32,
 	// 运行期调试开关：0 = 关闭；1 = 只画 alpha 覆盖（overdraw 用）
