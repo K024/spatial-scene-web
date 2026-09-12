@@ -8,6 +8,11 @@
  *   npx tsx scripts/infer-ply.ts --crop 0,0,545,748 # 从拼图里裁一张（teaser 图用）
  *   npx tsx scripts/infer-ply.ts --image X.jpg --out out.ply
  *
+ * 除 `.ply` 外还会写一个同名 `.camera.json`：SuperSplat 的相机位姿格式
+ * （INRIA `cameras.json`）。把两个文件**一起**拖进 https://superspl.at/editor，
+ * 相机就会跳到拍摄时的精确视角（见 `src/spatial-scene/export/camera.ts` 的坐标系说明）。
+ * 离线核对这个视角下画面是否与输入图对齐：`npx tsx scripts/check-camera.ts`。
+ *
  * 环境变量：
  *   SHARP_EP      覆盖执行提供者（逗号分隔的候选链）
  *   SHARP_MODEL   覆盖模型路径
@@ -26,6 +31,12 @@ import { mkdirSync, writeFileSync } from "node:fs"
 import { basename, resolve } from "node:path"
 import { parseArgs } from "node:util"
 
+import {
+  fovDeg,
+  poseTarget,
+  superSplatCameraJson,
+  superSplatCameraPose,
+} from "../src/spatial-scene/export/camera.ts"
 import { gaussiansToPly } from "../src/spatial-scene/export/ply.ts"
 import { runSharp } from "../src/spatial-scene/infer/index.ts"
 import type { ExecutionProviderHint } from "../src/spatial-scene/infer/session.ts"
@@ -155,10 +166,51 @@ async function main(): Promise<void> {
   writeFileSync(outPath, ply)
   console.log(`[ply] 写入 ${outPath}`)
 
+  // ── 5. 导出相机位姿（SuperSplat 的 json 格式）──
+  const pose = superSplatCameraPose({
+    name: stem + cropSuffix,
+    focalLengthPx: loaded.fPx,
+    imageShape: [loaded.image.width, loaded.image.height],
+    extrinsics: result.extrinsics,
+  })
+  const target = poseTarget({
+    position: pose.position,
+    forward: pose.rotation[2],
+  })
+  const fmt = (v: readonly number[]): string =>
+    v.map((n) => n.toFixed(4)).join(", ")
+  console.log(`[camera] position = [${fmt(pose.position)}]  (PLY 坐标系)`)
+  console.log(`[camera] target   = [${fmt(target)}]  (position + 10 * 朝向)`)
+  console.log(
+    `[camera] fov      = ${fovDeg(loaded.fPx, loaded.image.width).toFixed(3)}°(横) / ` +
+      `${fovDeg(loaded.fPx, loaded.image.height).toFixed(3)}°(竖)  ` +
+      `fx=fy=${loaded.fPx.toFixed(3)} @ ${loaded.image.width}x${loaded.image.height}`,
+  )
+
+  // 命名：把 .ply 换成 .camera.json；无扩展名时直接追加（避免覆盖 --out 指定的文件）
+  const cameraPath = outPath.toLowerCase().endsWith(".ply")
+    ? `${outPath.slice(0, -4)}.camera.json`
+    : `${outPath}.camera.json`
+  writeFileSync(cameraPath, superSplatCameraJson([pose]))
+  console.log(`[camera] 写入 ${cameraPath}`)
+
   await session.dispose()
 
   console.log()
-  console.log("提示：把该 .ply 拖入 https://superspl.at/editor 查看。")
+  console.log(
+    "提示：把该 .ply 与 .camera.json 一起拖入 https://superspl.at/editor。",
+  )
+  console.log(
+    "      只丢 .ply 会得到自动取景的环绕视角；带上 json 才回到拍摄视角。",
+  )
+  console.log(
+    "      想两轴都精确复原，把编辑器视口宽高比调成与原图一致（" +
+      `${loaded.image.width}:${loaded.image.height}）——` +
+      "SuperSplat 把 fov 作用在视口较长的轴上。",
+  )
+  console.log(
+    "      离线核对（无需浏览器/GPU）：npx tsx scripts/check-camera.ts",
+  )
   if (full) {
     console.log(
       "      --full 模式含 ml-sharp 补充 element，SuperSplat 可能忽略它们。",

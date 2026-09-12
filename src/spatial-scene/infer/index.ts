@@ -57,6 +57,13 @@ export interface RunSharpResult {
   disparity: { data: Float32Array; dims: number[] }
   /** 反投影矩阵（4x4 行主序）。 */
   unprojectionMatrix: Float64Array
+  /**
+   * 本次用的 extrinsics（4x4 行主序，**world -> camera**）。
+   *
+   * 当前恒为单位阵，因此度量空间 == 相机坐标系；导出相机位姿
+   * （`export/camera.ts`）直接由它推出，避免脚本里再假设一次。
+   */
+  extrinsics: Float64Array
   /** 实际喂入的 disparity_factor。 */
   disparityFactor: number
   /** 会话能力（EP / fp16 支持）。 */
@@ -172,6 +179,7 @@ export async function runSharp(opts: RunSharpOptions): Promise<{
         metric,
         disparity: parsed.disparity,
         unprojectionMatrix,
+        extrinsics,
         disparityFactor: disp,
         capabilities: session.capabilities,
       },
