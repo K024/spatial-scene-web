@@ -6,15 +6,18 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "lint": "oxlint",
+    "lint": "tsc -b && biome check .",
+    "format": "biome format --write .",
     "preview": "vite preview"
   },
   "dependencies": {
+    "onnxruntime-web": "^1.29.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },
   "devDependencies": {
     "@babel/core": "^8.0.5",
+    "@biomejs/biome": "^2.5.13",
     "@rolldown/plugin-babel": "^0.2.4",
     "@types/babel__core": "^7.20.5",
     "@types/node": "^24.13.3",
@@ -22,8 +25,12 @@
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.1",
     "babel-plugin-react-compiler": "^1.0.0",
-    "oxlint": "^1.82.0",
+    "canvas": "^3.2.3",
+    "onnxruntime-node": "^1.29.0",
+    "sharp": "^0.35.4",
+    "tsx": "^4.23.13",
     "typescript": "~7.0.2",
-    "vite": "^8.3.0"
+    "vite": "^8.3.0",
+    "webgpu": "^0.6.0"
   }
 }
