@@ -15,25 +15,28 @@
  * ```
  * 深度 z --(ndcDepthFromZ)--> 视差 n
  *   1. computeSupportMask        : 迟滞(α)支撑掩码 + 小岛剔除       -> support
- *   2. expandSupportWithMargin   : 外缘余量 + 源像素映射             -> mask / source
- *   3. computeTornEdges          : ★ 视差域断层撕裂 + despeckle      -> 撕裂边表
- *   4. buildLayerRelief          : 反投影 + 出四边形 + 裙边断壁      -> LayerMesh
+ *   2. computeTornEdges          : ★ 视差域断层撕裂 + 去噪 + despeckle + 小面片门 -> 撕裂边表
+ *   3. buildLayerRelief          : 反投影 + 出四边形 + 裙边断壁      -> LayerMesh
  * ```
- * 撕裂必须在余量**之后**：余量环也要按源深度参与撕裂，否则外扩会把断层糊上。
  * 裙边在**最后**：它消费「哪些四边形发射了」，才能认出网格边界边。
  *
+ * ── 层外缘 / 遮挡区的几何补齐去哪了 ──
+ * 旧版的 `margin.ts`（固定半径屏幕空间膨胀 + 最近源深度拷贝）已**移除**。
+ * 它现在由 `layering/refine.ts` 的几何补齐（own-gap 回填 + hidden 有界外推）承担：
+ * 产出的是**真实 RGBD**（含深度），meshing 只需消费补齐后的层。
+ *
  * ── LOD 出面（压面数）──
- * `options.lod` 打开时，第 3/4 步换成 `lod.ts` 的**受限四叉树**自适应出面：
+ * `options.lod` 打开时，第 2/3 步换成 `lod.ts` 的**受限四叉树**自适应出面：
  * 支撑 / 撕裂仍是硬约束（严格只在本层 α 可见范围内出面），但支撑边界与撕裂处的
  * 最小格子可粗到 `minCellPx`，平滑内部按视差误差 `maxError` 合并成大四边形。
- * 这条路**不生成裙边 / 余量**（那些属视角兜缝），面数从百万级降到 10–100k 量级。
+ * 这条路**不生成裙边**（裙边属视角兜缝），面数从百万级降到 10–100k 量级。
  * 缺省关闭 = 现有逐像素出面（golden 基线）。
  *
  * ── 全场收尾 ──
  * 所有层之后追加**背衬平面**：L 层 back-to-front 合成 → α 加权降采样 → 最远深度 quad。
  *
  * ── 文件划分 ──
- * `types.ts` 契约 / `tolerance.ts` 支撑 / `margin.ts` 余量 / `tears.ts` 撕裂 /
+ * `types.ts` 契约 / `tolerance.ts` 支撑 / `tears.ts` 撕裂 /
  * `relief.ts` 网格 / `backfill.ts` 回填。
  *
  * ── 硬要求 ──
@@ -43,9 +46,12 @@
 
 import { buildBackingPlane } from "./backfill.ts"
 import { buildLayerReliefLod } from "./lod.ts"
-import { expandSupportWithMargin } from "./margin.ts"
 import { buildLayerRelief, resolveSkirtDisparity } from "./relief.ts"
-import { computeDisparityField, computeTornEdges } from "./tears.ts"
+import {
+  computeDisparityField,
+  computeTornEdges,
+  resolveLayerTearOptions,
+} from "./tears.ts"
 import { computeSupportMask } from "./tolerance.ts"
 import type {
   LayerMesh,
@@ -65,14 +71,14 @@ export {
 export { toMeshingInput } from "./input.ts"
 export type { LodFrame, LodMeshResult, LodOptions, LodStats } from "./lod.ts"
 export { buildLayerReliefLod } from "./lod.ts"
-export type { MarginResult } from "./margin.ts"
-export { expandSupportWithMargin } from "./margin.ts"
 export type { LayerReliefStats, ReliefFrame } from "./relief.ts"
 export { buildLayerRelief, resolveSkirtDisparity } from "./relief.ts"
 export type { TornEdges } from "./tears.ts"
 export {
   computeDisparityField,
   computeTornEdges,
+  denoiseDisparity,
+  resolveLayerTearOptions,
   resolveTearEps,
 } from "./tears.ts"
 export type { SupportMaskFrame, SupportMaskResult } from "./tolerance.ts"
@@ -83,7 +89,6 @@ export type {
   LayerMesh,
   LayerMeshReport,
   LayerReliefContext,
-  MarginOptions,
   MeshingInput,
   MeshingOptions,
   MeshReport,
@@ -127,10 +132,6 @@ export function buildMeshScene(
     )
   }
 
-  const marginRadius = Math.max(
-    0,
-    Math.floor(options.margin?.radiusPixels ?? 0),
-  )
   const skirt = options.skirt === false ? null : (options.skirt ?? {})
 
   const layers = new Array<LayerMeshReport>(L)
@@ -146,32 +147,19 @@ export function buildMeshScene(
     }
     const bandWidth = placement.boundaries[k + 1] - placement.boundaries[k]
 
-    // 1) α 迟滞支撑 + 小岛剔除
+    // 1) α 迟滞支撑 + 小岛剔除（几何补齐已在 layering/refine.ts 做完；meshing 不再做外缘膨胀）
     const support = computeSupportMask(frame, options.alpha)
-    // 2) 余量：向外膨胀，并给出逐像素源（uv / 深度来源）
-    const margin = expandSupportWithMargin(
+    // 2) 撕裂：视差域阈值 + despeckle
+    const disparity = computeDisparityField(frame.depth, near, far)
+    const torn = computeTornEdges(
+      disparity,
       support.support,
       width,
       height,
-      marginRadius > 0 ? { radiusPixels: marginRadius } : {},
-    )
-    // 源深度场：环像素取最近支撑像素的深度（identity 时就是自己的深度）
-    const sourceDepth = new Float32Array(pixels)
-    for (let i = 0; i < pixels; i++) {
-      const s = margin.source[i]
-      sourceDepth[i] = s >= 0 ? frame.depth[s] : 0
-    }
-    // 3) 撕裂：视差域阈值 + despeckle
-    const disparity = computeDisparityField(sourceDepth, near, far)
-    const torn = computeTornEdges(
-      disparity,
-      margin.mask,
-      width,
-      height,
       bandWidth,
-      options.tears,
+      resolveLayerTearOptions(options.tears, k, L),
     )
-    // 4) 顶点 / 四边形 / 裙边
+    // 3) 顶点 / 四边形 / 裙边
     const skirtDisparity = skirt ? resolveSkirtDisparity(bandWidth, skirt) : 0
     const lodOptions = options.lod === false ? undefined : options.lod
     if (lodOptions) {
@@ -215,7 +203,6 @@ export function buildMeshScene(
         layerIndex: k,
         supportPixels: support.supportPixels,
         removedIslandPixels: support.removedIslandPixels,
-        marginPixels: margin.marginPixels,
         tearEps: torn.tearEps,
         tornEdges: torn.tornCount,
         despeckledEdges: torn.despeckledCount,
@@ -230,14 +217,13 @@ export function buildMeshScene(
     const { mesh, stats: reliefStats } = buildLayerRelief(
       frame,
       camera,
-      margin.mask,
+      support.support,
       torn,
       k,
       [placement.boundaries[k], placement.boundaries[k + 1]],
       [placement.boundariesZ[k], placement.boundariesZ[k + 1]],
       options.relief,
       {
-        source: margin.source,
         disparity,
         near,
         far,
@@ -249,7 +235,6 @@ export function buildMeshScene(
       layerIndex: k,
       supportPixels: support.supportPixels,
       removedIslandPixels: support.removedIslandPixels,
-      marginPixels: margin.marginPixels,
       tearEps: torn.tearEps,
       tornEdges: torn.tornCount,
       despeckledEdges: torn.despeckledCount,

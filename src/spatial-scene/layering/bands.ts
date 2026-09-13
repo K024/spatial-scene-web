@@ -15,10 +15,8 @@
  *
  * ── `overlap` 不碰分配 ──
  * `overlap` 只影响**报告的 depthRange**（`computeLayerRanges()`），给下游 mesh / 剔除留余量。
- * 早期版本把它做成了“让边界附近的高斯同时属于两层”，那是**错的**：`over` 不幂等，
- * 重复绘制会把 α 累加两次（`A over B` vs `(A over B) over A` 不等），
- * 重叠区会变得比原图更不透明，参考视角无损直接没了。
- * 消带缝要用别的手段（前端偏置分配 / 网格域回填），不能用重复绘制。
+ * 它**不能**用来在边界附近“重复绘制”：`over` 不幂等，重复会把 α 累加两次，
+ * 参考视角无损直接没了。边缘缺口的补全由 `refine.ts` 的几何补齐承担。
  *
  * ── 渲染器并不需要「层 = 连续区间」这个前提 ──
  * 渲染器只认一张排列（见 `LayerPermutation`）。本模块从全局序**抽取**出按层分组的排列，
@@ -31,9 +29,10 @@ import type { LayerBands, LayerPermutation, LayerTableEntry } from "./types.ts"
 
 export interface LayeredBandsOptions {
   /**
-   * 层间重叠，单位是**视差域比例**（`0.05` = 全视差范围的 5%）。默认 0。
+   * 层间重叠，单位是**视差域绝对值**（`0.02` = 全视差范围的 2%）。默认 0。
    *
    * ⚠ 它只影响 `computeLayerRanges()` 报告的 depthRange，**不影响分配**。
+   * 出货默认见 `scripts/pack/generate.ts` 的 `DEFAULT_LAYER_OVERLAP`。
    */
   overlap?: number
 }

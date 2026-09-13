@@ -39,12 +39,12 @@ import {
   buildMeshScene,
   compositeLayersBackToFront,
   downscaleAlphaWeighted,
-  expandSupportWithMargin,
   toMeshingInput,
 } from "../src/spatial-scene/meshing/index.ts"
 import {
   computeDisparityField,
   computeTornEdges,
+  resolveLayerTearOptions,
   resolveTearEps,
 } from "../src/spatial-scene/meshing/tears.ts"
 import { computeSupportMask } from "../src/spatial-scene/meshing/tolerance.ts"
@@ -190,6 +190,21 @@ function domainChecks(): void {
     "tearEps = clamp(scale·band, min, max)",
     ok,
     `mid=${mid} floor=${floored} cap=${capped}`,
+  )
+
+  // 底部层（背景）减少撕裂：阈值 ×2；非底部层不变；bottomFraction=0 可关。
+  const topEps = resolveTearEps(0.05, resolveLayerTearOptions({}, 3, 8))
+  const bottomEps = resolveTearEps(0.05, resolveLayerTearOptions({}, 6, 8))
+  const offEps = resolveTearEps(
+    0.05,
+    resolveLayerTearOptions({ layerBias: { bottomFraction: 0 } }, 6, 8),
+  )
+  addCheck(
+    "底部层撕裂阈值 ×bottomScale",
+    Math.abs(topEps - 0.02) < 1e-9 &&
+      Math.abs(bottomEps - 0.04) < 1e-9 &&
+      Math.abs(offEps - 0.02) < 1e-9,
+    `top=${topEps} bottom=${bottomEps} off=${offEps}`,
   )
 }
 
@@ -366,15 +381,41 @@ function despeckleChecks(): void {
 
   const kept = computeTornEdges(disparity, support, w, h, 0.4, {
     minTearSegmentLength: 6,
+    denoise: false,
   })
   const raw = computeTornEdges(disparity, support, w, h, 0.4, {
     minTearSegmentLength: 1,
+    denoise: false,
+    minPatchPixels: 1,
   })
   // 尖峰四周 4 条边；30° 台阶的连通分量（绕尖峰）应被 despeckle 整段清掉。
   addCheck(
     "despeckle：孤立尖峰的假缝被取消",
     raw.tornCount === 4 && kept.tornCount === 0 && kept.despeckledCount === 4,
     `原始 ${raw.tornCount} → despeckle 后 ${kept.tornCount}（清 ${kept.despeckledCount}）`,
+  )
+
+  // 去噪：同样的孤立尖峰，先做 3×3 中值后根本不产生撕裂边。
+  const denoised = computeTornEdges(disparity, support, w, h, 0.4, {
+    minTearSegmentLength: 1,
+    minPatchPixels: 1,
+  })
+  addCheck(
+    "去噪：孤立深度尖峰不产生撕裂",
+    denoised.tornCount === 0,
+    `中值去噪后 torn=${denoised.tornCount}`,
+  )
+
+  // 小面片门：关掉 despeckle，仅靠面片门把圈出 ~1px 的 4 条边重新连上。
+  const patched = computeTornEdges(disparity, support, w, h, 0.4, {
+    minTearSegmentLength: 1,
+    denoise: false,
+    minPatchPixels: 16,
+  })
+  addCheck(
+    "小面片门：圈出 ~1px 的撕裂被重新连上",
+    patched.tornCount === 0 && patched.patchReconnected === 4,
+    `torn=${patched.tornCount} patchReconnected=${patched.patchReconnected}`,
   )
 
   // 真实断层（横跨整幅）必须活下来：8 条边 ≥ 6。
@@ -736,66 +777,6 @@ function skirtChecks(): void {
     "裙边：墙三角形在表面之后（z 向后）",
     wallBehind,
     `墙顶点 z ≥ 2，表面顶点集大小 ${surfaceVerts.size}`,
-  )
-}
-
-// ────────────────────────────── A9 外缘余量（M2）──────────────────────────────
-
-function marginChecks(): void {
-  const w = 9
-  const h = 9
-  const support = new Uint8Array(w * h)
-  const center = 4 * w + 4
-  support[center] = 1
-  const m1 = expandSupportWithMargin(support, w, h, { radiusPixels: 1 })
-  let count1 = 0
-  let sourceOk = true
-  for (let i = 0; i < w * h; i++) {
-    count1 += m1.mask[i]
-    if (m1.mask[i] && m1.source[i] !== center) sourceOk = false
-  }
-  const m2 = expandSupportWithMargin(support, w, h, { radiusPixels: 2 })
-  let count2 = 0
-  for (let i = 0; i < w * h; i++) count2 += m2.mask[i]
-  addCheck(
-    "余量：radius=1 变成 5 像素（十字），源全指向中心",
-    count1 === 5 && m1.marginPixels === 4 && sourceOk,
-    `mask=${count1} margin=${m1.marginPixels} sourceOk=${sourceOk}`,
-  )
-  addCheck(
-    "余量：radius=2 变成 13 像素（菱形）",
-    count2 === 13,
-    `mask=${count2}`,
-  )
-
-  // 余量环的顶点：位置在环像素，但 uv/深度取自源。
-  const frame = makePixels(w, h, new Float32Array(w * h).fill(2), 0)
-  // 只让中心有 α，其余为 0；支撑就是中心一个像素。
-  frame.alpha[center] = 1
-  const cam = makeCamera(w, h)
-  const disparity = computeDisparityField(frame.depth, NEAR, FAR)
-  const torn = computeTornEdges(disparity, m1.mask, w, h, 0.4)
-  const { mesh } = buildLayerRelief(
-    frame,
-    cam,
-    m1.mask,
-    torn,
-    0,
-    [0, 1],
-    [2, 2],
-    {},
-    { source: m1.source, disparity, near: NEAR, far: FAR },
-  )
-  // 5 个掩码像素都有顶点；环顶点的 uv 应等于中心（源）的 uv。
-  const centerU = (4 + 0.5) / w
-  let uvOk = true
-  for (let v = 0; v < mesh.vertexCount; v++) {
-    if (Math.abs(mesh.uvs[v * 2] - centerU) > 1e-6) uvOk = false
-  }
-  addCheck(
-    "余量：环顶点 uv 取自源像素",
-    mesh.vertexCount === 5 && uvOk,
-    `顶点 ${mesh.vertexCount}，uvOk=${uvOk}`,
   )
 }
 
@@ -1313,10 +1294,7 @@ async function main(): Promise<void> {
   console.log("\n[A8] 裙边 / 断壁（M2）")
   skirtChecks()
 
-  console.log("\n[A9] 外缘余量（M2）")
-  marginChecks()
-
-  console.log("\n[A10] 回填 / 背衬平面（M3）")
+  console.log("\n[A9] 回填 / 背衬平面（M3）")
   backfillChecks()
 
   if (noGpu) {

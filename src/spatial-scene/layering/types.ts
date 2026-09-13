@@ -163,6 +163,11 @@ export interface LayerPermutation {
  *
  * 语义：层 `k` 拥有落进 `[boundaries[k], boundaries[k+1])` 的高斯，
  * 用 `layerDepths[k]` 这一个深度代表整层（这就是「L 个平面」的含义）。
+ *
+ * ── 边界为什么是**标量** ──
+ * 层深 / 边界只在视差域取**标量**，即每层是一个**前向平行等深平面**（MPI 语义），
+ * **不是**倾斜平面。下游只认“每层一个深度 / 一个区间”（`layerDepths` / `getLayerRange`），
+ * 任何依赖 (x,y) 的分界面都表达不了这套契约。
  */
 export interface LayerPlacement {
   readonly L: number

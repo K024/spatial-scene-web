@@ -60,7 +60,7 @@
  * - `tolerance.ts`    ← `mesh.py:generate_init_node`（小岛剔除）
  * - `relief.ts`       ← `mesh.py:create_mesh`（像素网格 + `extrapolation_thickness`）、
  *                        `mesh.py:generate_face`（四邻域出 2 三角、对角方向）
- * - `margin.ts`       ← `mesh_tools.py:enlarge_border` / `fill_dummy_bord`
+ * - `tolerance.ts`  支撑 / `tears.ts` 撕裂 / `relief.ts` 网格 / `backfill.ts` 回填
  * - `backfill.ts`     ← 无对应（它用修补网络）；改走 Apple `MXIBackLayer` + backing plane 的**
  *                        算法级**路线（`_concatRGBD` / `_downscaleAlphtaWeighted` / `_backLayerBlend`）
  * **不移植** SOLIDI 的 LDI 图机制（`reassign_floating_island`/`group_edges`/
@@ -126,6 +126,27 @@ export interface TearOptions {
    * 这是 `remove_redundant_edge` 提炼出的 despeckle。默认 `6`；`<= 1` 关闭。
    */
   minTearSegmentLength?: number
+  /** 阈值再乘的系数（`>1` = 更少撕裂）。一般由 `layerBias` 推导，不直接手填。 */
+  thresholdScale?: number
+  /**
+   * 撕裂判据前先对**视差场**做 3×3 中值去噪（只在支撑内取样）。默认 `true`。
+   *
+   * 撕裂判据用的就是 α 混合出来的 `depth`，数值上不可靠；孤立毛刺会产生假撕裂。
+   * **顶点位置不受影响**（只用去噪场算阈值比较）。
+   */
+  denoise?: boolean
+  /**
+   * 「小面片」门：torn 边从支撑图移除后，分量像素数小于此值的，其边界 torn 边
+   * 取消（重新连上）。治“中间小三角被撕掉”。默认 `16`；`<= 1` 关闭。
+   */
+  minPatchPixels?: number
+  /**
+   * **按层地位**减少撕裂：层号 `k >= (1 − bottomFraction)·L` 的底部层（背景）
+   * 撕裂阈值乘 `bottomScale`。缺省 `0.25` / `2`（可通过 `bottomFraction: 0` 关闭）。
+   *
+   * 背景层视差形变小、橡皮布不明显，但撕裂留缝会直接露背景 ⇒ 宁可少撕。
+   */
+  layerBias?: { bottomFraction?: number; bottomScale?: number }
 }
 
 /** relief 网格化选项。 */
@@ -169,21 +190,6 @@ export interface SkirtOptions {
 }
 
 /**
- * 层外缘余量（`extendedTexture` 的**几何侧**）。
- *
- * 把支撑掩码向外膨胀 `radiusPixels`，环上像素用**最近支撑像素**的 uv / 深度
- * （向外拉伸边缘纹理），把每层的几何延伸到剪影之外。默认关闭：它会外扩剪影约 `radius` 像素，
- * 与「参考视角逐 texel 精确」互斥，属于取舍而非 bug。
- *
- * @see SOLIDI `mesh_tools.py:enlarge_border` / `fill_dummy_bord`（`extrapolation_thickness=60`）
- *   —— vt-vl-lab/3d-photo-inpainting @ de04467 (MIT)
- */
-export interface MarginOptions {
-  /** 膨胀半径（像素）。默认 `0`（关闭）。 */
-  radiusPixels?: number
-}
-
-/**
  * 回填 / 背衬平面的选项。
  *
  * 算法级：把 L 层 α 加权降采样合成一张粗纹理，贴在最远深度的背衬平面上，
@@ -201,11 +207,9 @@ export interface BackfillOptions {
   depth?: number
 }
 
-/** `buildLayerRelief` 的**运行时数据**（不是旋钮）：源像素映射、视差、近远平面、裙边宽度。 */
+/** `buildLayerRelief` 的**运行时数据**（不是旋钮）：视差、近远平面、裙边宽度。 */
 export interface LayerReliefContext {
-  /** 逐像素源像素下标（margin 环指向最近支撑像素）；缺省 = 恒等。 */
-  readonly source?: ArrayLike<number>
-  /** 逐像素视差（已按 `source` 重映射）；裙边宽度换算用。 */
+  /** 逐像素视差；裙边宽度换算用。 */
   readonly disparity?: ArrayLike<number>
   /** 投影近平面（米），裙边换回真实深度用。 */
   readonly near?: number
@@ -222,8 +226,6 @@ export interface MeshingOptions {
   readonly relief?: ReliefOptions
   /** 裙边 / 断壁。`false` 关闭；缺省 = 开启（用 `SkirtOptions` 默认）。 */
   readonly skirt?: SkirtOptions | false
-  /** 层外缘余量。 */
-  readonly margin?: MarginOptions
   /** 背衬平面 / 回填。 */
   readonly backing?: BackfillOptions
   /**
@@ -290,8 +292,6 @@ export interface LayerMeshReport {
   readonly supportPixels: number
   /** 被小岛剔除的像素数。 */
   readonly removedIslandPixels: number
-  /** 余量环新增像素数。 */
-  readonly marginPixels: number
   /** 实际生效的撕裂阈值（视差域）。 */
   readonly tearEps: number
   /** 撕裂边数（despeckle 之后）。 */

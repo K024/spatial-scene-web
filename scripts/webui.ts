@@ -39,6 +39,7 @@ import type { MeshScene } from "../src/spatial-scene/meshing/index.ts"
 import type { SourceImage } from "../src/spatial-scene/sharp/preprocess.ts"
 import {
   buildGlb,
+  DEFAULT_LAYER_OVERLAP,
   inferSceneFromImage,
   type StageProgress,
 } from "./pack/generate.ts"
@@ -77,8 +78,19 @@ interface Source {
 interface UiConfig {
   readonly layers: number
   readonly method: LayerSamplingMethod
+  /** 层间重叠（只影响报告的 `layerRanges`）。 */
   readonly overlap: number
   readonly refine: boolean
+  /** 几何补齐（own-gap + hidden 外推）。 */
+  readonly complete: boolean
+  /** hidden 外推最大距离（px）。 */
+  readonly maxDist: number
+  /** hidden 是否外推 RGBA（关 = 只补几何、保留原纹理 α）。 */
+  readonly extrapRgba: boolean
+  /** own-gap 回填（关 = 定位边缘硬点）。 */
+  readonly ownGap: boolean
+  /** 撕裂清理（视差去噪 + 小面片门）。**缺省关**（库默认开）。 */
+  readonly tearCleanup: boolean
   readonly draco: boolean
   /** LOD 出面（受限四叉树）开关与参数。 */
   readonly lod: boolean
@@ -158,7 +170,11 @@ function configKey(source: Source, cfg: UiConfig): string {
     cfg.method,
     cfg.overlap,
     cfg.refine,
+    cfg.complete
+      ? `complete${cfg.maxDist}${cfg.extrapRgba ? "" : "d"}${cfg.ownGap ? "" : "n"}`
+      : "nocomplete",
     cfg.draco,
+    cfg.tearCleanup ? "tearClean" : "tearRaw",
     cfg.lod ? `lod${cfg.lodMinCell}${cfg.lodSnap ? "s" : "n"}` : "dense",
   ].join("|")
 }
@@ -224,16 +240,28 @@ function ensureBuilt(
       binCount: BIN_COUNT,
       overlap: cfg.overlap,
       refine: cfg.refine,
-      draco: cfg.draco,
-      mesh: cfg.lod
+      complete: cfg.complete
         ? {
-            lod: {
-              minCellPx: cfg.lodMinCell,
-              maxError: 0.005,
-              snapBoundary: cfg.lodSnap,
-            },
+            ownGap: cfg.ownGap,
+            hidden: { maxDistancePx: cfg.maxDist, rgba: cfg.extrapRgba },
           }
-        : {},
+        : false,
+      draco: cfg.draco,
+      mesh: {
+        tears: {
+          denoise: cfg.tearCleanup,
+          minPatchPixels: cfg.tearCleanup ? 16 : 1,
+        },
+        ...(cfg.lod
+          ? {
+              lod: {
+                minCellPx: cfg.lodMinCell,
+                maxError: 0.005,
+                snapBoundary: cfg.lodSnap,
+              },
+            }
+          : {}),
+      },
       onStage,
     })
     return toView(source, cfg, cached, result)
@@ -294,7 +322,12 @@ function toView(
 
 function glbFileName(source: Source, cfg: UiConfig): string {
   const stem = sanitize(basename(source.path, extname(source.path)))
-  return `${stem}_L${cfg.layers}_${cfg.method}${cfg.draco ? "_draco" : ""}.glb`
+  const ov = `ov${cfg.overlap}`
+  const comp = cfg.complete
+    ? `c${cfg.maxDist}${cfg.extrapRgba ? "" : "d"}${cfg.ownGap ? "" : "n"}`
+    : "nc"
+  const tear = cfg.tearCleanup ? "tc" : "tr"
+  return `${stem}_L${cfg.layers}_${cfg.method}_${ov}_${comp}_${tear}${cfg.draco ? "_draco" : ""}.glb`
 }
 
 function sanitize(name: string): string {
@@ -338,7 +371,39 @@ async function executor(br: NodeManager): Promise<void> {
     options: METHODS.map((m) => ({ value: m, label: m })),
     defaultValue: "quantile",
   }) as LayerSamplingMethod
+  const overlap = br.numberInput({
+    label: "层间重叠（只影响 layerRanges）",
+    defaultValue: DEFAULT_LAYER_OVERLAP,
+    min: 0,
+    max: 0.1,
+    step: 0.005,
+    precision: 3,
+  })
   const refine = br.toggle({ label: "原图回写 refine", defaultValue: true })
+  const complete = br.toggle({
+    label: "几何补齐（own-gap + hidden 外推）",
+    defaultValue: true,
+  })
+  const maxDist = br.numberInput({
+    label: "hidden 外推最大距离（px）",
+    defaultValue: 16,
+    min: 0,
+    max: 128,
+    step: 2,
+    precision: 0,
+  })
+  const extrapRgba = br.toggle({
+    label: "hidden 外推 RGBA（开 = 拉伸边缘；关 = 只补几何）",
+    defaultValue: false,
+  })
+  const ownGap = br.toggle({
+    label: "own-gap 回填（关 = 定位边缘硬点）",
+    defaultValue: true,
+  })
+  const tearCleanup = br.toggle({
+    label: "撕裂清理（视差去噪 + 小面片门；库默认开）",
+    defaultValue: false,
+  })
   const draco = br.toggle({ label: "Draco 压缩几何", defaultValue: true })
   const lod = br.toggle({
     label: "LOD 出面（自适应四叉树）",
@@ -365,8 +430,13 @@ async function executor(br: NodeManager): Promise<void> {
   const cfg: UiConfig = {
     layers: Math.min(layers, MAX_LAYERS),
     method,
-    overlap: 0,
+    overlap: Math.max(0, overlap),
     refine,
+    complete,
+    maxDist: Math.max(0, Math.round(maxDist)),
+    extrapRgba,
+    ownGap,
+    tearCleanup,
     draco,
     lod,
     lodMinCell,
@@ -391,7 +461,11 @@ async function executor(br: NodeManager): Promise<void> {
   const view = viewMemo.get(configKey(source, cfg))
   if (!view) {
     br.write({
-      body: `**${source.label}** · L=${cfg.layers} · ${cfg.method} · refine=${refine ? "on" : "off"} · draco=${draco ? "on" : "off"}\n\n点 **「生成 GLB」** 开始。`,
+      body:
+        `**${source.label}** · L=${cfg.layers} · ${cfg.method} · ` +
+        `overlap=${cfg.overlap} · refine=${refine ? "on" : "off"} · ` +
+        `complete=${cfg.complete ? `hidden<=${cfg.maxDist}px${cfg.extrapRgba ? "" : " depth-only"}${cfg.ownGap ? "" : " no-own-gap"}` : "off"} · ` +
+        `draco=${draco ? "on" : "off"}\n\n点 **「生成 GLB」** 开始。`,
     })
     return
   }
@@ -409,6 +483,14 @@ async function executor(br: NodeManager): Promise<void> {
     items: [
       { label: "分辨率", value: `${view.width}×${view.height}` },
       { label: "层数", value: view.config.layers },
+      {
+        label: "层重叠 / 补齐",
+        value:
+          `${view.config.overlap} / ` +
+          (view.config.complete
+            ? `hidden<=${view.config.maxDist}px${view.config.extrapRgba ? "" : "・depth-only"}${view.config.ownGap ? "" : "・no-own-gap"}`
+            : "off"),
+      },
       { label: "三角", value: view.totalTriangles.toLocaleString() },
       {
         label: "GLB",

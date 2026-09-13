@@ -7,7 +7,7 @@
  * - `bands.ts`        排序序列 -> 层区间 / 排列
  * - `disparity-stats.ts` 视差域统计（直方图 / 分位数 / 矩）
  * - `placement.ts`    层边界放置（7 族 target 生成器）
- * - `refine.ts`       原图回写（权重 / 混合 / 整摞 `refineLayers`）
+ * - `refine.ts`       原图回写（权重 / 混合）+ **逐层几何补齐**（own-gap / hidden 外推）
  *
  * ── 不提供什么（刻意的）──
  * **分层渲染（`renderLayerStack`）不在 `src` 里**：它需要装配 PLY 场景并驱动 WebGPU
@@ -54,9 +54,18 @@ export {
   quantizationError,
   uniformDepths,
 } from "./placement.ts"
-export type { RefineLayersOptions, RefineWeightOptions } from "./refine.ts"
+export type {
+  HiddenExtendOptions,
+  LayerCompletionOptions,
+  RefineLayersOptions,
+  RefineWeightOptions,
+} from "./refine.ts"
 export {
   blendImageWriteback,
+  completeLayerGeometry,
+  compositeAlphaDepth,
+  computeLayerOwnership,
+  computeOcclusionMasks,
   computeRefineWeight,
   layerPixelToImagePixel,
   refineLayers,

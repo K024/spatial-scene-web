@@ -1,14 +1,14 @@
 /**
  * relief 网格化：把一层 RGBAD（heightfield）变成顶点 + 表面三角形 + 裙边断壁。
  *
- * 阶段：meshing 的第三步（支撑掩码 + 余量 + 撕裂边表之后）。
+ * 阶段：meshing 的第二步（支撑掩码 + 撕裂边表之后）。
  *
  * ── 几何为什么是 heightfield ──
  * 每层都是**渲出来的 2D 帧**：每像素恰好一个 `depth`，所以几何恒为 `z(u,v)`。
  * 这带来一个强简化：**一个支撑像素一个顶点**，四边形天然共享顶点，撕裂只是**不发射**那个
  * 四边形。不需要 LDI 图、浮动岛、悬空边那套「每像素多深度节点」的机制。
  *
- * ── 顶点 = 同内参反投影（+ 余量源映射）──
+ * ── 顶点 = 同内参反投影 ──
  * `camera.ts` 已写死：mesh 是 LDI / relief mesh，顶点 = 该像素按**同一透视内参**反投影的
  * `(u, v, z)`。这里用列主序 `viewMatrix` 的轴分解还原相机轴，避免再求一次 4x4 逆：
  * ```
@@ -19,9 +19,9 @@
  * ```
  * `fx = width / (2·tan(fovX/2))`（相机只支持居中主点，`cx=W/2, cy=H/2`）。
  *
- * ⚠ 余量环（见 `margin.ts`）的顶点：**位置**在环像素自己的 `(u,v)`，但 **z 与 uv 取自
- * `context.source[i]`**（最近支撑像素）。这样几何在屏幕平面向外铺开、纹理拉伸边缘，
- * 不会把背景色拉出来。
+ * ⚠ 顶点：**位置与 z / uv 都取自该像素自己**。旧的「余量环（最近支撑像素拉伸）」已移除 ——
+ * 层外缘/遮挡区的几何补齐改在 `layering/refine.ts` 里完成（产出真实 RGBD），
+ * meshing 只需消费补齐后的层。
  *
  * ── 出四边形（含撕裂与对角翻转）──
  * 四边形 `(x,y)-(x+1,y)-(x,y+1)-(x+1,y+1)` 只在**四角都在支撑内**且**四条边都没被撕开**
@@ -86,7 +86,7 @@ const DEFAULT_OPAQUE_ALPHA = 0.99
  *
  * @param disparityRange 该层视差带 `[lo, hi]`（只写进元数据，不参与几何）。
  * @param depthRange 该层真实深度带 `[lo, hi]` 米（只写进元数据）。
- * @param context `source`（余量源映射）、`disparity`、`near`/`far`、`skirtDisparity`。
+ * @param context `disparity`、`near`/`far`、`skirtDisparity`。
  */
 export function buildLayerRelief(
   frame: ReliefFrame,
@@ -108,7 +108,6 @@ export function buildLayerRelief(
   const pixels = width * height
   const allowDiagonalFlip = options.allowDiagonalFlip ?? true
   const opaqueAlpha = options.opaqueAlpha ?? DEFAULT_OPAQUE_ALPHA
-  const source = context.source
 
   const fx = width / (2 * Math.tan(camera.fovX / 2))
   const fy = height / (2 * Math.tan(camera.fovY / 2))
@@ -120,7 +119,6 @@ export function buildLayerRelief(
   const fwd: [number, number, number] = [view[2], view[6], view[10]]
   const origin = camera.position
 
-  const sourceOf = (i: number): number => (source ? source[i] : i)
   const place: PlaceVertex = (out, v, x, y, z) => {
     const camX = ((x + 0.5 - cx) / fx) * z
     const camY = ((y + 0.5 - cy) / fy) * z
@@ -134,7 +132,7 @@ export function buildLayerRelief(
   const vertexPixel: number[] = []
   let vertexCount = 0
   for (let i = 0; i < pixels; i++) {
-    if (support[i] && depth[sourceOf(i)] > 0) {
+    if (support[i] && depth[i] > 0) {
       pixelToVertex[i] = vertexCount++
       vertexPixel.push(i)
     }
@@ -145,15 +143,12 @@ export function buildLayerRelief(
   let uvs: Float32Array = new Float32Array(vertexCount * 2)
   for (let v = 0; v < vertexCount; v++) {
     const i = vertexPixel[v]
-    const src = sourceOf(i)
-    const z = depth[src]
+    const z = depth[i]
     const x = i % width
     const y = (i - x) / width
     place(positions, v, x, y, z)
-    const sx = src % width
-    const sy = (src - sx) / width
-    uvs[v * 2] = (sx + 0.5) / width
-    uvs[v * 2 + 1] = (sy + 0.5) / height
+    uvs[v * 2] = (x + 0.5) / width
+    uvs[v * 2 + 1] = (y + 0.5) / height
   }
 
   // ── 四边形：先判定发射，再精确分配索引缓冲 ──

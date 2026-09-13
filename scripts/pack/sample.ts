@@ -19,6 +19,11 @@
  *   npx tsx scripts/pack/sample.ts --lod-min-cell 8                  # 手动指定最小格子
  *   npx tsx scripts/pack/sample.ts --width 768                       # 降采样（快速调试）
  *   npx tsx scripts/pack/sample.ts --no-lod                          # 逐像素出面（对照）
+ *   npx tsx scripts/pack/sample.ts --overlap 0.02 --max-dist 16       # 层范围余量 / 隐藏区外推距离
+ *   npx tsx scripts/pack/sample.ts --extrap-rgba                       # hidden 也拉伸边缘 RGBA（缺省只补几何）
+ *   npx tsx scripts/pack/sample.ts --no-own-gap                       # 只做 hidden 外推（定位边缘硬点）
+ *   npx tsx scripts/pack/sample.ts --no-complete                     # 关闭几何补齐（对照）
+ *   npx tsx scripts/pack/sample.ts --tear-cleanup                      # 开启撕裂去噪 + 小面片门（库默认，sample 缺省关）
  */
 
 import { mkdirSync, writeFileSync } from "node:fs"
@@ -26,7 +31,11 @@ import { resolve } from "node:path"
 import { DEFAULT_IMAGE, prepareOrtEnv, REPO_ROOT } from "../utils/common.ts"
 import { createNodeDevice } from "../utils/webgpu.ts"
 import { assembleWSplatScene } from "../utils/wsplat-scene.ts"
-import { buildGlb, inferSceneFromImage } from "./generate.ts"
+import {
+  buildGlb,
+  DEFAULT_LAYER_OVERLAP,
+  inferSceneFromImage,
+} from "./generate.ts"
 
 /**
  * 内置样例的**推荐 LOD 出面配置**（默认值；与 `lod.ts` 默认一致）。
@@ -58,12 +67,27 @@ interface Args {
   width: number | "native"
   draco: boolean
   out: string
+  /** 层间重叠（只影响报告的 `layerRanges`）；默认 `DEFAULT_LAYER_OVERLAP`。 */
+  overlap: number
+  /** 几何补齐（own-gap + hidden 外推）；`--no-complete` 关。 */
+  complete: boolean
+  /** own-gap 回填（`--no-own-gap` 关，用于定位边缘硬点来源）。 */
+  ownGap: boolean
+  /** hidden 外推最大距离（px）。 */
+  maxDist: number
+  /** hidden 是否外推 RGBA（默认关 = 只补几何、保留原纹理 α；`--extrap-rgba` 开）。 */
+  extrapRgba: boolean
   /** LOD 出面开关（`--no-lod` 关；默认开）。 */
   lod: boolean
   /** 最小格子（像素）；`"auto"` = 按分辨率推导（见 `autoMinCell`）。 */
   lodMinCell: number | "auto"
   lodMaxError: number
   lodSnap: boolean
+  /**
+   * 撕裂清理（视差去噪 + 小面片门）。**缺省关**。
+   * 库默认是开（`denoise:true, minPatchPixels:16`），这里刻意只在 sample 关掉，便于对照。
+   */
+  tearCleanup: boolean
 }
 
 function parseArgs(argv: readonly string[]): Args {
@@ -73,10 +97,16 @@ function parseArgs(argv: readonly string[]): Args {
     width: "native",
     draco: true,
     out: resolve(REPO_ROOT, "public", "models", "sample.glb"),
+    overlap: DEFAULT_LAYER_OVERLAP,
+    complete: true,
+    ownGap: true,
+    maxDist: 16,
+    extrapRgba: false,
     lod: true,
     lodMinCell: RECOMMENDED.minCellPx,
     lodMaxError: RECOMMENDED.maxError,
     lodSnap: RECOMMENDED.snapBoundary,
+    tearCleanup: false,
   }
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]
@@ -88,11 +118,17 @@ function parseArgs(argv: readonly string[]): Args {
       args.width = v === "native" ? "native" : Number(v)
     } else if (flag === "--no-draco") args.draco = false
     else if (flag === "--out") args.out = resolve(next())
+    else if (flag === "--overlap") args.overlap = Number(next())
+    else if (flag === "--no-complete") args.complete = false
+    else if (flag === "--no-own-gap") args.ownGap = false
+    else if (flag === "--max-dist") args.maxDist = Number(next())
+    else if (flag === "--extrap-rgba") args.extrapRgba = true
     else if (flag === "--no-lod") args.lod = false
     else if (flag === "--lod-min-cell") args.lodMinCell = Number(next())
     else if (flag === "--lod-max-error") args.lodMaxError = Number(next())
     else if (flag === "--lod-snap") args.lodSnap = true
     else if (flag === "--no-lod-snap") args.lodSnap = false
+    else if (flag === "--tear-cleanup") args.tearCleanup = true
   }
   return args
 }
@@ -124,17 +160,30 @@ async function main(): Promise<void> {
     const result = await buildGlb(device, scene, inferred.loaded.image, {
       layers: args.layers,
       method: "quantile",
+      overlap: args.overlap,
       refine: true,
-      draco: args.draco,
-      mesh: args.lod
+      complete: args.complete
         ? {
-            lod: {
-              minCellPx: lodMinCell,
-              maxError: args.lodMaxError,
-              snapBoundary: args.lodSnap,
-            },
+            ownGap: args.ownGap,
+            hidden: { maxDistancePx: args.maxDist, rgba: args.extrapRgba },
           }
-        : {},
+        : false,
+      draco: args.draco,
+      mesh: {
+        tears: {
+          denoise: args.tearCleanup,
+          minPatchPixels: args.tearCleanup ? 16 : 1,
+        },
+        ...(args.lod
+          ? {
+              lod: {
+                minCellPx: lodMinCell,
+                maxError: args.lodMaxError,
+                snapBoundary: args.lodSnap,
+              },
+            }
+          : {}),
+      },
       onStage: (stage, detail) => {
         console.log(`[sample] ${stage}${detail ? ` · ${detail}` : ""}`)
       },
@@ -148,6 +197,8 @@ async function main(): Promise<void> {
     console.log(
       `[sample] ${args.out} · ${(result.glb.length / 1024 / 1024).toFixed(2)} MB · ` +
         `${scene.width}x${scene.height} · L=${args.layers} · tri=${tris} · ` +
+        `overlap=${args.overlap} · complete=${args.complete ? `hidden<=${args.maxDist}px${args.extrapRgba ? "" : " depth-only"}${args.ownGap ? "" : " no-own-gap"}` : "off"} · ` +
+        `tearCleanup=${args.tearCleanup ? "on" : "off"} · ` +
         (args.lod
           ? `LOD minCell=${lodMinCell}${
               args.lodMinCell === "auto" ? "(auto)" : ""

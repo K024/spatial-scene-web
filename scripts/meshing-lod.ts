@@ -257,6 +257,7 @@ function runSynthetic(): void {
           tearEps: 0,
           tornCount: 0,
           despeckledCount: 0,
+          patchReconnected: 0,
         },
         opts,
       )

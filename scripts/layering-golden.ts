@@ -72,6 +72,10 @@ import {
 } from "../src/spatial-scene/layering/placement.ts"
 import {
   blendImageWriteback,
+  completeLayerGeometry,
+  compositeAlphaDepth,
+  computeLayerOwnership,
+  computeOcclusionMasks,
   computeRefineWeight,
   layerPixelToImagePixel,
 } from "../src/spatial-scene/layering/refine.ts"
@@ -317,6 +321,247 @@ function refineChecks(): void {
       ok && scaled.x === 0.5 && scaled.y === 0.5,
       "同分辨率恒等 / 缩放",
       `scale(0,0)=(${scaled.x},${scaled.y})`,
+    )
+  }
+}
+
+// ────────────────────────────── 几何补齐（refine 扩展，纯 CPU） ──────────────────────────────
+
+/** 造一个最小 `WSplatFrame`（全背景：α=0 / depth=0）。 */
+function makeFrame(width: number, height: number): WSplatFrame {
+  const px = width * height
+  return {
+    width,
+    height,
+    preview: new Uint8Array(px * 4),
+    rgb: new Float32Array(px * 3),
+    alpha: new Float32Array(px),
+    depth: new Float32Array(px),
+    transmission: new Float32Array(px).fill(1),
+    accumulatedDepth: new Float32Array(px),
+    visible: new Uint8Array(px),
+  }
+}
+
+/** 在 `frame` 的像素 `i` 放一个单表面 `(z, α, rgb)`。 */
+function setSurface(
+  frame: WSplatFrame,
+  i: number,
+  z: number,
+  a = 1,
+  rgb: readonly [number, number, number] = [0.2, 0.4, 0.6],
+): void {
+  frame.alpha[i] = a
+  frame.depth[i] = z
+  frame.accumulatedDepth[i] = a * z
+  frame.transmission[i] = 1 - a
+  frame.visible[i] = 1
+  frame.rgb[i * 3] = rgb[0]
+  frame.rgb[i * 3 + 1] = rgb[1]
+  frame.rgb[i * 3 + 2] = rgb[2]
+}
+
+/**
+ * `refine` 的**几何补齐**不变量。全是纯 CPU：
+ * 合成口径、遮挡掩码、own-gap 回填、hidden 有界外推（含带夹紧与限距）。
+ */
+function completionChecks(): void {
+  const w = 8
+  const h = 8
+  const px = w * h
+  const imageLinear = new Float32Array(px * 3).fill(0.9)
+  const placement = {
+    near: 1,
+    far: 3,
+    boundariesZ: new Float32Array([1, 2, 3]),
+  }
+
+  // 1) compositeAlphaDepth：远层 α=1/z=2.5，近层 α=0.5/z=1.5。
+  //    far: ed=2.5, A=1；near: ed = 0.5*1.5 + 0.5*2.5 = 2.0, A = 1。⇒ D = 2.0。
+  {
+    const near = makeFrame(w, h)
+    const far = makeFrame(w, h)
+    for (let i = 0; i < px; i++) {
+      setSurface(near, i, 1.5, 0.5)
+      setSurface(far, i, 2.5, 1)
+    }
+    const c = compositeAlphaDepth([near, far], px)
+    compOk.record(
+      Math.abs(c.alpha[0] - 1) < 1e-6 && Math.abs(c.depth[0] - 2.0) < 1e-5,
+      "合成 α / D",
+      `A=${c.alpha[0].toFixed(4)} D=${c.depth[0].toFixed(4)}（期望 1 / 2）`,
+    )
+  }
+
+  // 2) 遮挡掩码：层 0 不透明 ⇒ occluded[0]=0、occluded[1]=1。
+  {
+    const l0 = makeFrame(w, h)
+    const l1 = makeFrame(w, h)
+    setSurface(l0, 0, 1.5, 1)
+    const occ = computeOcclusionMasks([l0, l1], px)
+    occOk.record(
+      occ[0][0] === 0 && occ[1][0] === 1 && occ[1][1] === 0,
+      "逐层遮挡",
+      `occ0[0]=${occ[0][0]} occ1[0]=${occ[1][0]} occ1[1]=${occ[1][1]}`,
+    )
+  }
+
+  // 3) own-gap 小洞填补（α 归属 + 不外溢）：
+  //    a) 洞：层 0 除 (3,3) 外都有支撑（α=1），洞处 α=0.4、层 1 同点 α=0.3。
+  //       α 归属：w_0=0.4 > w_1=0.18，A_total=0.58>τ ⇒ 层 0 负责但偏低 ⇒ 应补上。
+  //    b) 边缘外点：层 0 只在 x≤2 有支撑，(3,3) 也是最大贡献者，
+  //       但外侧无支撑（不被夹住）⇒ **不应**补。
+  {
+    const hole = 3 * w + 3
+    const l0 = makeFrame(w, h)
+    const l1 = makeFrame(w, h)
+    for (let i = 0; i < px; i++) setSurface(l0, i, 1.5, 1)
+    setSurface(l0, hole, 1.5, 0.4)
+    setSurface(l1, hole, 2.5, 0.3)
+    const out = completeLayerGeometry([l0, l1], placement, imageLinear, w, h, {
+      hidden: false,
+    })
+    const f = out[0]
+    const holeOk =
+      Math.abs(f.alpha[hole] - 1) < 1e-6 &&
+      Math.abs(f.depth[hole] - 1.5) < 1e-5 &&
+      Math.abs(f.rgb[hole * 3] - 0.9) < 1e-6
+
+    const m0 = makeFrame(w, h)
+    const m1 = makeFrame(w, h)
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x <= 2; x++) setSurface(m0, y * w + x, 1.5, 1)
+    }
+    setSurface(m0, hole, 1.5, 0.4)
+    setSurface(m1, hole, 2.5, 0.3)
+    const out2 = completeLayerGeometry([m0, m1], placement, imageLinear, w, h, {
+      hidden: false,
+    })
+    const fringeOk = Math.abs(out2[0].alpha[hole] - 0.4) < 1e-6
+
+    ownGapOk.record(
+      holeOk && fringeOk,
+      "own-gap 小洞填补（α 归属 + 边缘不外溢）",
+      `洞 α=${f.alpha[hole]} D=${f.depth[hole]}；边缘 α=${out2[0].alpha[hole]}`,
+    )
+  }
+
+  // 4) hidden dilate 外推：层 0（更近）盖住中心 2×2（带 0），层 1（更远）只盖住右侧 1×2（带 1，α=0.9）。
+  //    层 1 应从自己的支撑向左侧被遮挡区外推：深度夹到本层带 [2,3]，限距 ≤2px；
+  //    `rgba:true` 时 α = 源α·(1−d/(R+1))（距离衰减），rgb 本层自有优先（本层 α=0 ⇒ 取源色）。
+  {
+    const l0 = makeFrame(w, h)
+    const l1 = makeFrame(w, h)
+    const hiddenBlock: [number, number][] = [
+      [3, 3],
+      [4, 3],
+      [3, 4],
+      [4, 4],
+    ]
+    const supportBlock: [number, number][] = [
+      [5, 3],
+      [5, 4],
+    ]
+    for (const [x, y] of hiddenBlock) setSurface(l0, y * w + x, 1.5, 1)
+    for (const [x, y] of supportBlock) setSurface(l1, y * w + x, 2.5, 0.9)
+    const out = completeLayerGeometry([l0, l1], placement, imageLinear, w, h, {
+      ownGap: false,
+      hidden: { maxDistancePx: 2, smoothPasses: 1, rgba: true },
+    })
+    const f = out[1]
+    let filled = 0
+    let badDepth = 0
+    let badAlpha = 0
+    let tooFar = 0
+    let nearAlpha = -1
+    let farAlpha = -1
+    const inSupport = (x: number, y: number): boolean =>
+      supportBlock.some(([bx, by]) => bx === x && by === y)
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x
+        if (!(f.alpha[i] > 1e-6) || inSupport(x, y)) continue
+        filled++
+        if (!(f.depth[i] >= 2 - 1e-6 && f.depth[i] <= 3 + 1e-6)) badDepth++
+        // dilate：α 不超过源 α（0.9），且随距离单调不增
+        if (f.alpha[i] > 0.9 + 1e-6) badAlpha++
+        // rgb 本层自有优先：本层 α=0 ⇒ 应取源色 (0.2,0.4,0.6)
+        if (Math.abs(f.rgb[i * 3] - 0.2) > 1e-6) badAlpha++
+        let mdist = Infinity
+        for (const [bx, by] of supportBlock) {
+          mdist = Math.min(mdist, Math.abs(x - bx) + Math.abs(y - by))
+        }
+        if (mdist > 2) tooFar++
+        if (mdist === 1) nearAlpha = f.alpha[i]
+        if (mdist === 2) farAlpha = f.alpha[i]
+      }
+    }
+    const falloffOk = nearAlpha > farAlpha && farAlpha > 0
+    hiddenOk.record(
+      filled >= 4 &&
+        badDepth === 0 &&
+        badAlpha === 0 &&
+        tooFar === 0 &&
+        falloffOk,
+      "hidden dilate 外推 + 带夹紧 + 距离衰减 + 本层 rgb 优先",
+      `填充 ${filled}，越带 ${badDepth}，越 α/色 ${badAlpha}，超距 ${tooFar}，近/远 α=${nearAlpha.toFixed(2)}/${farAlpha.toFixed(2)}`,
+    )
+  }
+
+  // 5) hidden 只补几何（`rgba:false`）：同样的外推，但 α/rgb 保留原值，只写 depth。
+  {
+    const l0 = makeFrame(w, h)
+    const l1 = makeFrame(w, h)
+    const hiddenBlock: [number, number][] = [
+      [4, 3],
+      [3, 3],
+    ]
+    const supportBlock: [number, number][] = [[5, 3]]
+    for (const [x, y] of hiddenBlock) setSurface(l0, y * w + x, 1.5, 1)
+    for (const [x, y] of supportBlock) setSurface(l1, y * w + x, 2.5, 1)
+    const out = completeLayerGeometry([l0, l1], placement, imageLinear, w, h, {
+      ownGap: false,
+      hidden: { maxDistancePx: 2, smoothPasses: 1, rgba: false },
+    })
+    const f = out[1]
+    const i = 3 * w + 3
+    const depthExtended =
+      f.depth[i] > 0 && f.depth[i] >= 2 - 1e-6 && f.depth[i] <= 3 + 1e-6
+    const appearanceKept =
+      Math.abs(f.alpha[i] - l1.alpha[i]) < 1e-6 &&
+      Math.abs(f.rgb[i * 3] - l1.rgb[i * 3]) < 1e-6
+    hiddenGeoOk.record(
+      depthExtended && appearanceKept && f.visible[i] === 1,
+      "hidden 只补几何（保留原 α/rgb）",
+      `d=${f.depth[i].toFixed(3)} α=${f.alpha[i]}${depthExtended && appearanceKept ? " ✓" : ""}`,
+    )
+  }
+
+  // 6) α 归属：`owner = argmax_k (1−A_{<k})·α_k`；`frontBefore[k] = A_{<k}`（不看 wsplat depth）。
+  {
+    const f0 = makeFrame(w, h)
+    const f1 = makeFrame(w, h)
+    const i = 4 * w + 4
+    f0.alpha[i] = 0.4
+    f1.alpha[i] = 0.3
+    const own = computeLayerOwnership([f0, f1], px)
+    const caseA =
+      own.owner[i] === 0 &&
+      Math.abs(own.frontBefore[1][i] - 0.4) < 1e-6 &&
+      Math.abs(own.totalAlpha[i] - 0.58) < 1e-6
+
+    const g0 = makeFrame(w, h)
+    const g1 = makeFrame(w, h)
+    const j = 5 * w + 5
+    g0.alpha[j] = 0.3
+    g1.alpha[j] = 0.5
+    const own2 = computeLayerOwnership([g0, g1], px)
+    const caseB = own2.owner[j] === 1
+
+    ownerOk.record(
+      caseA && caseB,
+      "α 归属 = argmax 边际贡献",
+      `α=(0.4,0.3)→owner ${own.owner[i]}，A<1=${own.frontBefore[1][i].toFixed(2)}，Atotal=${own.totalAlpha[i].toFixed(2)}；α=(0.3,0.5)→owner ${own2.owner[j]}`,
     )
   }
 }
@@ -713,6 +958,12 @@ const refRange = new Invariant("回写权重门控 + 范围 ∈ [0,1]")
 const refSmooth = new Invariant("回写平滑因子单调")
 const refBlend = new Invariant("回写混合端点（w=0/1/0.5）")
 const refMap = new Invariant("层↔原图映射（同分辨率恒等）")
+const compOk = new Invariant("几何补齐：合成 α / D")
+const occOk = new Invariant("几何补齐：逐层遮挡")
+const ownGapOk = new Invariant("几何补齐：own-gap 回填")
+const hiddenOk = new Invariant("几何补齐：hidden 有界外推")
+const hiddenGeoOk = new Invariant("几何补齐：hidden depth-only")
+const ownerOk = new Invariant("几何补齐：α 归属")
 
 /**
  * 前密指纹：`frontWeighted` 的最激进、`quantile` 是等质量基线、`hybrid` 在两者之间。
@@ -1333,8 +1584,9 @@ async function main(): Promise<void> {
 
   domainChecks()
 
-  console.log("\n[A0b] 原图回写（refine.ts，纯 CPU）")
+  console.log("\n[A0b] 原图回写 + 几何补齐（refine.ts，纯 CPU）")
   refineChecks()
+  completionChecks()
 
   console.log("\n[A1] 统计量正确性（uniform-n 合成分布，200k 样本）")
   const reference = makeSynthetic(DISTRIBUTIONS[0], 200_000, 0x5eed)
@@ -1373,6 +1625,12 @@ async function main(): Promise<void> {
   refSmooth.report()
   refBlend.report()
   refMap.report()
+  compOk.report()
+  occOk.report()
+  ownGapOk.report()
+  hiddenOk.report()
+  hiddenGeoOk.report()
+  ownerOk.report()
 
   if (!noReal) {
     realDataChecks(plyPath)

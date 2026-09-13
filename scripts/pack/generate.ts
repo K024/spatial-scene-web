@@ -22,6 +22,7 @@ import type {
   SessionCapabilities,
 } from "../../src/spatial-scene/infer/session.ts"
 import {
+  type LayerCompletionOptions,
   type LayeredRGBD,
   type LayerSamplingMethod,
   refineLayers,
@@ -144,10 +145,17 @@ export interface BuildGlbOptions {
   method?: LayerSamplingMethod
   /** 直方图箱数。默认 `256`。 */
   binCount?: number
-  /** 层间重叠（只影响报告的 `layerRanges`）。默认 `0`。 */
+  /** 层间重叠（只影响报告的 `layerRanges`）。默认 `DEFAULT_LAYER_OVERLAP`。 */
   overlap?: number
   /** 原图回写；给了 `sourceImage` 时默认开。 */
   refine?: boolean
+  /**
+   * 几何补齐（`refineLayers` 的 own-gap 回填 + hidden 有界外推）。
+   *
+   * 缺省 = 开启（`{}`）；`false` = 关闭（退回纯颜色回写）。
+   * 需要 `sourceImage`（与 `refine` 同一条件）。
+   */
+  complete?: LayerCompletionOptions | false
   /** Draco 压缩几何（默认开）。 */
   draco?: boolean
   /** meshing 选项（含 `lod` 出面）。缺省 = 逐像素出面（百万级）。 */
@@ -155,6 +163,21 @@ export interface BuildGlbOptions {
   /** 阶段进度（可选）。 */
   onStage?: StageProgress
 }
+
+/**
+ * 层间重叠（层深范围交叠）的默认值：视差域绝对量 **`0.02`**。
+ *
+ * ── 它是什么 / 不是什么 ──
+ * 只作用于 `toMeshingInput` 报告的 `layerRanges`（渲染侧按层深范围剔除/裁剪的余量），
+ * **不改层分配 / 排列 / 几何**（重复绘制会破坏参考视角无损，详见 `layering/bands.ts`）。
+ *
+ * ── 为什么默认不是 0 ──
+ * 几何补齐把隐藏区深度夹到本层带 `[b_k, b_{k+1}]`，边界上的顶点若用零余量区间做剔除，
+ * 会在切分处被削掉一条；给一点余量最省事。
+ * 量级参考：`L=8` 的平均层带宽是 `1/8 = 0.125`，`0.02 ≈ 层带宽的 1/6`，
+ * 足以吸收边界舍入而不产生明显 over-draw；层数越多可适当调小。
+ */
+export const DEFAULT_LAYER_OVERLAP = 0.02
 
 /** 一次「场景 -> GLB」的产物。 */
 export interface BuildGlbResult {
@@ -196,13 +219,17 @@ export async function buildGlb(
   let layered: LayeredRGBD = base
   let refined = false
   if (options.refine !== false && sourceImage) {
-    layered = refineLayers(base, sourceImage)
+    layered = refineLayers(base, sourceImage, { complete: options.complete })
     refined = true
   }
 
   const t1 = Date.now()
   await options.onStage?.("网格化")
-  const input = toMeshingInput(layered, scene.camera, options.overlap ?? 0)
+  const input = toMeshingInput(
+    layered,
+    scene.camera,
+    options.overlap ?? DEFAULT_LAYER_OVERLAP,
+  )
   const meshScene = buildMeshScene(input, options.mesh ?? {})
   const meshMs = Date.now() - t1
   await options.onStage?.("网格化完成", `${(meshMs / 1000).toFixed(1)}s`)
