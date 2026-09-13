@@ -37,7 +37,7 @@
  */
 
 import type { Material, Mesh } from "three"
-import { Color, DoubleSide, MeshBasicMaterial } from "three"
+import { Color, FrontSide, MeshBasicMaterial } from "three"
 import type { LoadedScene } from "./types.ts"
 
 /** 一条 mesh 的两套材质；`wire` 懒建（用户没开过线框就一直是 `null`）。 */
@@ -128,7 +128,8 @@ export function disposeSceneWireframe(scene: LoadedScene): void {
  * - `wireframe: true` —— 见文件头，交给 three 生成线段索引；
  * - `transparent` 继承基准材质的 α（保证淡入淡出跨模式一致）；
  * - `depthWrite/depthTest = true` —— 线框要能被正确遮挡（见文件头「深度口径」）；
- * - `side = DoubleSide` —— 裙边断壁绕序相反；线框本身不受面剔除影响，写它是为了显式；
+ * - `side = FrontSide` —— 线框走 `gl.LINES`，不受面剔除影响；写它只是为了避开 three 对
+ *   「`transparent` + `DoubleSide`」的两次绘制（它会白翻倍 draw，见 `scene.ts` 的材质口径）；
  * - `toneMapped: false` —— 与标准模式同一口径（照片色 / 几何色都不过色调映射）。
  */
 function createWireMaterial(
@@ -142,7 +143,7 @@ function createWireMaterial(
     opacity: base.opacity,
     depthWrite: true,
     depthTest: true,
-    side: DoubleSide,
+    side: FrontSide,
     toneMapped: false,
   })
 }

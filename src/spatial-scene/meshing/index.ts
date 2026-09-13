@@ -22,6 +22,13 @@
  * 撕裂必须在余量**之后**：余量环也要按源深度参与撕裂，否则外扩会把断层糊上。
  * 裙边在**最后**：它消费「哪些四边形发射了」，才能认出网格边界边。
  *
+ * ── LOD 出面（压面数）──
+ * `options.lod` 打开时，第 3/4 步换成 `lod.ts` 的**受限四叉树**自适应出面：
+ * 支撑 / 撕裂仍是硬约束（严格只在本层 α 可见范围内出面），但支撑边界与撕裂处的
+ * 最小格子可粗到 `minCellPx`，平滑内部按视差误差 `maxError` 合并成大四边形。
+ * 这条路**不生成裙边 / 余量**（那些属视角兜缝），面数从百万级降到 10–100k 量级。
+ * 缺省关闭 = 现有逐像素出面（golden 基线）。
+ *
  * ── 全场收尾 ──
  * 所有层之后追加**背衬平面**：L 层 back-to-front 合成 → α 加权降采样 → 最远深度 quad。
  *
@@ -35,6 +42,7 @@
  */
 
 import { buildBackingPlane } from "./backfill.ts"
+import { buildLayerReliefLod } from "./lod.ts"
 import { expandSupportWithMargin } from "./margin.ts"
 import { buildLayerRelief, resolveSkirtDisparity } from "./relief.ts"
 import { computeDisparityField, computeTornEdges } from "./tears.ts"
@@ -55,6 +63,8 @@ export {
   downscaleAlphaWeighted,
 } from "./backfill.ts"
 export { toMeshingInput } from "./input.ts"
+export type { LodFrame, LodMeshResult, LodOptions, LodStats } from "./lod.ts"
+export { buildLayerReliefLod } from "./lod.ts"
 export type { MarginResult } from "./margin.ts"
 export { expandSupportWithMargin } from "./margin.ts"
 export type { LayerReliefStats, ReliefFrame } from "./relief.ts"
@@ -163,6 +173,60 @@ export function buildMeshScene(
     )
     // 4) 顶点 / 四边形 / 裙边
     const skirtDisparity = skirt ? resolveSkirtDisparity(bandWidth, skirt) : 0
+    const lodOptions = options.lod === false ? undefined : options.lod
+    if (lodOptions) {
+      // LOD 出面：受限四叉树自适应（无裙边；裙边属视角兜缝，见 lod.ts）。
+      const lod = buildLayerReliefLod(
+        frame,
+        camera,
+        support.support,
+        disparity,
+        torn,
+        lodOptions,
+      )
+      const opaqueTriangleCount = countOpaqueTriangles(
+        lod,
+        frame.alpha,
+        width,
+        height,
+      )
+      meshes[k] = {
+        layerIndex: k,
+        width,
+        height,
+        vertexCount: lod.stats.vertexCount,
+        triangleCount: lod.stats.triangleCount,
+        wallTriangleCount: 0,
+        opaqueTriangleCount,
+        positions: lod.positions,
+        uvs: lod.uvs,
+        indices: lod.indices,
+        texture: { width, height, rgb: frame.rgb, alpha: frame.alpha },
+        disparityRange: [
+          placement.boundaries[k],
+          placement.boundaries[k + 1],
+        ] as [number, number],
+        depthRange: [
+          placement.boundariesZ[k],
+          placement.boundariesZ[k + 1],
+        ] as [number, number],
+      }
+      layers[k] = {
+        layerIndex: k,
+        supportPixels: support.supportPixels,
+        removedIslandPixels: support.removedIslandPixels,
+        marginPixels: margin.marginPixels,
+        tearEps: torn.tearEps,
+        tornEdges: torn.tornCount,
+        despeckledEdges: torn.despeckledCount,
+        quadsEmitted: lod.stats.leaves,
+        quadsSkipped: 0,
+        boundaryEdges: 0,
+        wallTriangles: 0,
+        skirtDisparity: 0,
+      }
+      continue
+    }
     const { mesh, stats: reliefStats } = buildLayerRelief(
       frame,
       camera,
@@ -221,4 +285,40 @@ export function buildMeshScene(
     premultipliedAlpha: false,
     report: { layers },
   }
+}
+
+/** 三个角纹理 α 都 ≥ `opaqueAlpha` 的三角形数（供 `SeparateOpaqueGeometry`）。 */
+function countOpaqueTriangles(
+  mesh: {
+    readonly uvs: Float32Array
+    readonly indices: Uint32Array
+  },
+  alpha: Float32Array,
+  width: number,
+  height: number,
+  opaqueAlpha = 0.99,
+): number {
+  const triCount = mesh.indices.length / 3
+  const texel = (v: number): number => {
+    const x = Math.min(
+      width - 1,
+      Math.max(0, Math.round(mesh.uvs[v * 2] * width - 0.5)),
+    )
+    const y = Math.min(
+      height - 1,
+      Math.max(0, Math.round(mesh.uvs[v * 2 + 1] * height - 0.5)),
+    )
+    return y * width + x
+  }
+  let count = 0
+  for (let t = 0; t < triCount; t++) {
+    if (
+      alpha[texel(mesh.indices[t * 3])] >= opaqueAlpha &&
+      alpha[texel(mesh.indices[t * 3 + 1])] >= opaqueAlpha &&
+      alpha[texel(mesh.indices[t * 3 + 2])] >= opaqueAlpha
+    ) {
+      count++
+    }
+  }
+  return count
 }

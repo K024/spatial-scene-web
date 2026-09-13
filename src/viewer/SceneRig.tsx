@@ -89,6 +89,18 @@ export function SceneRig() {
     void resetToken
   }, [scene, resetToken, invalidate])
 
+  // ── drei 辅助元素的开关必须**在提交之后**自己续一帧 ──
+  // `<Grid>` / `<GizmoHelper>`（后者经 `Hud` 带 `renderPriority`）挂载 / 卸载时，
+  // r3f 提交期的自动 `invalidateInstance` **不可靠**：它被 `internal.frames === 0`
+  // 挡住，而 `Hud` 的 priority 渲染路径又让主场景改由它自己画。结果是开关生效了
+  // 但画布不重绘。放在 `useEffect`（提交后）里显式 `invalidate()`，保证立刻可见。
+  useEffect(() => {
+    // 两个信号只当「开关变了」的触发器，值本身不参与计算。
+    void showGrid
+    void showGizmo
+    invalidate()
+  }, [showGrid, showGizmo, invalidate])
+
   const grid = scene ? gridParams(scene) : null
 
   return (

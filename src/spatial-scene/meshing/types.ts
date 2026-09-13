@@ -70,6 +70,7 @@
 
 import type { DisparityStats, LayeredRGBD } from "../layering/types.ts"
 import type { WSplatCamera } from "../wsplat/camera.ts"
+import type { LodOptions } from "./lod.ts"
 
 /**
  * meshing 的输入 = layering 的产出 + 渲染用的相机。
@@ -225,6 +226,11 @@ export interface MeshingOptions {
   readonly margin?: MarginOptions
   /** 背衬平面 / 回填。 */
   readonly backing?: BackfillOptions
+  /**
+   * LOD 出面（受限四叉树自适应）。缺省 / `false` = 逐像素出面（现有行为）。
+   * 面数从百万级压到 10–100k 量级；语义与约束见 `lod.ts`。
+   */
+  readonly lod?: LodOptions | false
 }
 
 /**

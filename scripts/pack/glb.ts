@@ -175,7 +175,11 @@ async function buildMeshNode(
     .setBaseColorTexture(texture)
     .setBaseColorFactor([1, 1, 1, 1])
     .setAlphaMode("BLEND")
-    .setDoubleSided(true)
+    // 只有**含裙边断壁**的 mesh 才需要双面（墙的绕序朝外）。可双面 + `BLEND` 会让 three 走
+    // 两次绘制（`transparent && side===DoubleSide && !forceSinglePass` ⇒ BackSide 一遍、
+    // FrontSide 一遍，见 three `renderBufferDirect`），白白翻倍 draw 与填充。
+    // LOD 出面没有裙边 ⇒ 单面，顺带拿到背面剔除。
+    .setDoubleSided(mesh.wallTriangleCount > 0)
   // 照片纹理 = 已经是最终颜色，不要再走 PBR 光照（否则需要法线且在 three 里会变黑）。
   material.setExtension("KHR_materials_unlit", unlit.createUnlit())
 

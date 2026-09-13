@@ -80,6 +80,10 @@ interface UiConfig {
   readonly overlap: number
   readonly refine: boolean
   readonly draco: boolean
+  /** LOD 出面（受限四叉树）开关与参数。 */
+  readonly lod: boolean
+  readonly lodMinCell: number
+  readonly lodSnap: boolean
 }
 
 /** 一次生成的结果引用（GLB 字节在磁盘，下载时懒读）。 */
@@ -155,6 +159,7 @@ function configKey(source: Source, cfg: UiConfig): string {
     cfg.overlap,
     cfg.refine,
     cfg.draco,
+    cfg.lod ? `lod${cfg.lodMinCell}${cfg.lodSnap ? "s" : "n"}` : "dense",
   ].join("|")
 }
 
@@ -220,6 +225,15 @@ function ensureBuilt(
       overlap: cfg.overlap,
       refine: cfg.refine,
       draco: cfg.draco,
+      mesh: cfg.lod
+        ? {
+            lod: {
+              minCellPx: cfg.lodMinCell,
+              maxError: 0.005,
+              snapBoundary: cfg.lodSnap,
+            },
+          }
+        : {},
       onStage,
     })
     return toView(source, cfg, cached, result)
@@ -326,6 +340,21 @@ async function executor(br: NodeManager): Promise<void> {
   }) as LayerSamplingMethod
   const refine = br.toggle({ label: "原图回写 refine", defaultValue: true })
   const draco = br.toggle({ label: "Draco 压缩几何", defaultValue: true })
+  const lod = br.toggle({
+    label: "LOD 出面（自适应四叉树）",
+    defaultValue: true,
+  })
+  const lodMinCell = br.slider({
+    label: "LOD 最小格子（像素，越大面越少）",
+    min: 1,
+    max: 8,
+    step: 1,
+    defaultValue: 4,
+  })
+  const lodSnap = br.toggle({
+    label: "LOD 边界贴合（靠纹理 α 掩边）",
+    defaultValue: true,
+  })
 
   const source = resolveSource(uploads[0])
   if (!source) {
@@ -339,6 +368,9 @@ async function executor(br: NodeManager): Promise<void> {
     overlap: 0,
     refine,
     draco,
+    lod,
+    lodMinCell,
+    lodSnap,
   }
 
   // ── 显式触发（≈ `if st.button(...)`）：只有 `true` 那次 rerun 计算 ──

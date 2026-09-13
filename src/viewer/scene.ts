@@ -27,7 +27,7 @@
  */
 
 import type { Material, Mesh, Object3D } from "three"
-import { Box3, DoubleSide, Vector3 } from "three"
+import { Box3, Vector3 } from "three"
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js"
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js"
 import type {
@@ -181,7 +181,12 @@ async function readAll(
 
 /**
  * 材质口径。GLTFLoader 对 `alphaMode: BLEND` 已设 `transparent = true`、
- * `depthWrite = false`，这里只补它管不到的（色调映射 / 双面 / 重编译标记）。
+ * `depthWrite = false`，这里只补它管不到的（色调映射 / 重编译标记）。
+ *
+ * ⚠ **不要在这里强制 `side = DoubleSide`**：可双面 + `transparent` 会让 three 把每个 mesh
+ * 画两遍（BackSide 一遍、FrontSide 一遍，见 `WebGLRenderer.renderBufferDirect`），
+ * draw 与填充翻倍。`side` 由导出器的 `doubleSided` 决定：只有含裙边断壁的密集出面才是
+ * 双面，LOD 出面（无裙边）是单面，顺带拿到背面剔除。
  */
 function applyMaterialPolicy(mesh: Mesh): void {
   const materials: Material[] = Array.isArray(mesh.material)
@@ -193,8 +198,6 @@ function applyMaterialPolicy(mesh: Mesh): void {
     material.depthTest = true
     // 照片纹理是最终颜色：不能再走 renderer 的色调映射（r3f 默认 ACESFilmic）。
     material.toneMapped = false
-    // 裙边断壁是背面；导出器写了 doubleSided，这里再钉一次防上游改动。
-    material.side = DoubleSide
     material.needsUpdate = true
   }
 }

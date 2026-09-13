@@ -28,6 +28,7 @@ import {
 } from "../../src/spatial-scene/layering/index.ts"
 import {
   buildMeshScene,
+  type MeshingOptions,
   type MeshScene,
   toMeshingInput,
 } from "../../src/spatial-scene/meshing/index.ts"
@@ -149,6 +150,8 @@ export interface BuildGlbOptions {
   refine?: boolean
   /** Draco 压缩几何（默认开）。 */
   draco?: boolean
+  /** meshing 选项（含 `lod` 出面）。缺省 = 逐像素出面（百万级）。 */
+  mesh?: MeshingOptions
   /** 阶段进度（可选）。 */
   onStage?: StageProgress
 }
@@ -200,7 +203,7 @@ export async function buildGlb(
   const t1 = Date.now()
   await options.onStage?.("网格化")
   const input = toMeshingInput(layered, scene.camera, options.overlap ?? 0)
-  const meshScene = buildMeshScene(input)
+  const meshScene = buildMeshScene(input, options.mesh ?? {})
   const meshMs = Date.now() - t1
   await options.onStage?.("网格化完成", `${(meshMs / 1000).toFixed(1)}s`)
 

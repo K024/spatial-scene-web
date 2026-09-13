@@ -7,11 +7,14 @@
  * `invalidate()` 之后渲一帧，静止时帧率为 0。
  *
  * ── 谁负责 invalidate（分工明确，别重复也别漏）──
- * 1. **React 驱动的场景图变更** —— r3f 自己管：reconciler 的 `commitUpdate` /
- *    `appendChild` / `removeChild` 都会走 `invalidateInstance`，在 `internal.frames === 0`
+ * 1. **React 驱动的场景图变更** —— r3f 通常自己管：reconciler 的 `commitUpdate` /
+ *    `appendChild` / `removeChild` 会走 `invalidateInstance`，在 `internal.frames === 0`
  *    时 `invalidate()`（见 `@react-three/fiber` 源码）。
- *    所以 `<Grid>` / `<GizmoHelper>` / `<primitive>` 的挂载与 prop 变化（比如
- *    `$showGrid` / `$showGizmo` 的开关）**不需要**在这里列。
+ *    ⚠ 但这条**对 drei 辅助元素不可靠**：`<GizmoHelper>` 经 `<Hud>` 注册了
+ *    `renderPriority` 的 `useFrame`，主场景改由它自己画；开关提交时 `frames` 又常
+ *    非 0，于是不会续帧。所以 `$showGrid` / `$showGizmo` **不在本文件列**，而是由
+ *    `SceneRig`（`Grid` / `GizmoHelper` 的宿主）在**提交之后**的 `useEffect` 里
+ *    显式 `invalidate()` —— 放这里会在 React 提交**之前**触发，可能画出旧状态。
  * 2. **drei 的交互** —— 也自己管：`OrbitControls` 在 `change` 事件里
  *    `invalidate()` + `performance.regress()`（后者喂给 `<AdaptiveDpr />`）。
  * 3. **命令式变更** —— 就是本组件存在的理由：直接改 `mesh.visible` /

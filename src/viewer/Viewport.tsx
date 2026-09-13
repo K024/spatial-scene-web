@@ -22,6 +22,7 @@ import { AdaptiveDpr } from "@react-three/drei"
 import { Canvas } from "@react-three/fiber"
 import { InvalidateOnChange } from "./Invalidate.tsx"
 import { ModelRoot } from "./ModelRoot.tsx"
+import { PerfProbe } from "./PerfProbe.tsx"
 import { SceneRig } from "./SceneRig.tsx"
 
 /** 站点背景色（与 `index.css` 的 body 一致，避免首帧闪白）。 */
@@ -46,6 +47,7 @@ export function Viewport() {
       <ModelRoot />
       <SceneRig />
       <AdaptiveDpr />
+      <PerfProbe />
     </Canvas>
   )
 }
