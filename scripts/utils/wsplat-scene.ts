@@ -121,20 +121,28 @@ export function plyToGaussians3D(
   return { meanVectors, singularValues, quaternions, colors, opacities }
 }
 
-/** 装配场景（读 PLY + 相机 json，建相机）。 */
-export function loadWSplatScene(options: WSplatSceneOptions = {}): WSplatScene {
-  const plyPath = resolve(
-    REPO_ROOT,
-    options.plyPath ?? "py-models/out/ply/example.ply",
-  )
-  const cameraPath = resolve(
-    REPO_ROOT,
-    options.cameraPath ?? plyPath.replace(/\.ply$/i, ".camera.json"),
-  )
-  const ply = readPlyGaussiansFull(plyPath)
-  const gaussians = plyToGaussians3D(ply, options.maxSplats)
-  const pose = readCameraPose(cameraPath)
+/** 装配 `WSplatScene` 所需的、与数据来源无关的字段。 */
+export interface AssembleWSplatSceneOptions {
+  gaussians: Gaussians3D
+  pose: CameraPose
+  /** 渲染宽度（语义同 `WSplatSceneOptions.width`）。 */
+  width?: string | number
+  near?: number
+  far?: number
+  plyPath?: string
+  cameraPath?: string
+}
 
+/**
+ * 由**已在内存里**的高斯 + 相机位姿装配 `WSplatScene`。
+ *
+ * `loadWSplatScene`（读 PLY）与「上传图片 -> 推理」都走这里，
+ * 保证分辨率 / near-far / 相机内参的推导只有一份实现。
+ */
+export function assembleWSplatScene(
+  options: AssembleWSplatSceneOptions,
+): WSplatScene {
+  const { gaussians, pose } = options
   const width = resolveTargetWidth(options.width, pose.width)
   const height = Math.round((width * pose.height) / pose.width)
   const scale = width / pose.width
@@ -156,8 +164,8 @@ export function loadWSplatScene(options: WSplatSceneOptions = {}): WSplatScene {
   })
 
   return {
-    plyPath,
-    cameraPath,
+    plyPath: options.plyPath ?? "",
+    cameraPath: options.cameraPath ?? "",
     gaussians,
     camera,
     pose,
@@ -168,6 +176,43 @@ export function loadWSplatScene(options: WSplatSceneOptions = {}): WSplatScene {
     far,
     depthRange,
   }
+}
+
+/** 读 PLY + 相机 json 的原始产物（尚未按分辨率装配成场景）。 */
+export interface WSplatSource {
+  readonly plyPath: string
+  readonly cameraPath: string
+  readonly gaussians: Gaussians3D
+  readonly pose: CameraPose
+}
+
+/** 只做 I/O：读高斯与位姿，不建相机 / 不定 near-far（分辨率无关，可缓存）。 */
+export function loadWSplatSource(
+  options: WSplatSceneOptions = {},
+): WSplatSource {
+  const plyPath = resolve(
+    REPO_ROOT,
+    options.plyPath ?? "py-models/out/ply/example.ply",
+  )
+  const cameraPath = resolve(
+    REPO_ROOT,
+    options.cameraPath ?? plyPath.replace(/\.ply$/i, ".camera.json"),
+  )
+  const ply = readPlyGaussiansFull(plyPath)
+  const gaussians = plyToGaussians3D(ply, options.maxSplats)
+  const pose = readCameraPose(cameraPath)
+  return { plyPath, cameraPath, gaussians, pose }
+}
+
+/** 装配场景（读 PLY + 相机 json，建相机）。 */
+export function loadWSplatScene(options: WSplatSceneOptions = {}): WSplatScene {
+  const source = loadWSplatSource(options)
+  return assembleWSplatScene({
+    ...source,
+    width: options.width,
+    near: options.near,
+    far: options.far,
+  })
 }
 
 /** 把 `--width` 的值解析成像素宽度。 */

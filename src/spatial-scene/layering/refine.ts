@@ -46,7 +46,9 @@
  *   「splat 近似」变成「原图」，E2 必须分「几何合成 / 颜色合成」两栏报。
  */
 
+import type { SourceImage } from "../sharp/preprocess.ts"
 import type { WSplatFrame } from "../wsplat/types.ts"
+import type { LayeredRGBD } from "./types.ts"
 
 /** 回写权重的三个可调因子。 */
 export interface RefineWeightOptions {
@@ -155,4 +157,110 @@ export function layerPixelToImagePixel(
     x: ((x + 0.5) * imageWidth) / layerWidth - 0.5,
     y: ((y + 0.5) * imageHeight) / layerHeight - 0.5,
   }
+}
+
+/** 整摞回写的旋钮 = 逐层权重因子 + 回写层范围。 */
+export interface RefineLayersOptions extends RefineWeightOptions {
+  /**
+   * 回写层范围：层号 `< foregroundLayers` 才回写（`0` = 关闭，缺省 = `L` = 全部）。
+   *
+   * ⚠ 逐像素还有 `occluded` 遮挡门，所以「全部层」的实际效果仍是
+   * 「每个像素只在它**最前的不透明层**回写一次」。
+   */
+  foregroundLayers?: number
+}
+
+/** 逐像素「已被更近的不透明层覆盖」的判定阈值（与回写权重的 `minAlpha` 默认值一致）。 */
+const OPAQUE_ALPHA = 0.5
+
+/**
+ * 原图（sRGB uint8 HWC）双线性重采样到层分辨率 + 线性化，返回直通线性 RGB `[w*h*3]`。
+ *
+ * 参考相机 == 原图相机 ⇒ 映射是恒等 + 缩放，所以只需要分辨率重采样，不需要内参。
+ * 双线性对越界索引做 clamp（与 `sharp/preprocess.ts` 的 `F.interpolate` 语义一致）。
+ */
+export function resampleImageToLinear(
+  src: SourceImage,
+  width: number,
+  height: number,
+): Float32Array {
+  const out = new Float32Array(width * height * 3)
+  const { data, width: sw, height: sh, channels: ch } = src
+  for (let y = 0; y < height; y++) {
+    const fy = ((y + 0.5) * sh) / height - 0.5
+    const y0 = Math.min(sh - 1, Math.max(0, Math.floor(fy)))
+    const y1 = Math.min(sh - 1, y0 + 1)
+    const ty = Math.min(1, Math.max(0, fy - y0))
+    for (let x = 0; x < width; x++) {
+      const fx = ((x + 0.5) * sw) / width - 0.5
+      const x0 = Math.min(sw - 1, Math.max(0, Math.floor(fx)))
+      const x1 = Math.min(sw - 1, x0 + 1)
+      const tx = Math.min(1, Math.max(0, fx - x0))
+      const o = (y * width + x) * 3
+      for (let c = 0; c < 3; c++) {
+        const p00 = data[(y0 * sw + x0) * ch + c]
+        const p10 = data[(y0 * sw + x1) * ch + c]
+        const p01 = data[(y1 * sw + x0) * ch + c]
+        const p11 = data[(y1 * sw + x1) * ch + c]
+        const top = p00 + (p10 - p00) * tx
+        const bot = p01 + (p11 - p01) * tx
+        out[o + c] = srgbToLinear((top + (bot - top) * ty) / 255)
+      }
+    }
+  }
+  return out
+}
+
+/**
+ * 对整摞层做原图回写，返回**新的一摞**（除 `frames[].rgb` 外全部复用）。
+ *
+ * 流程：原图重采样到层分辨率 -> 算逐层遮挡掩码 -> 逐层算权重并混合颜色。
+ * 不改几何（`alpha` / `depth` / `transmission` / `visible` 原样保留）。
+ *
+ * ⚠ 回写只在参考视角成立：外推时那块颜色会露「贴图感」。是否开启由调用方决定。
+ */
+export function refineLayers(
+  layered: LayeredRGBD,
+  image: SourceImage,
+  options: RefineLayersOptions = {},
+): LayeredRGBD {
+  const L = layered.frames.length
+  if (L === 0) return layered
+  const { width, height } = layered
+  const pixels = width * height
+  const imageLinear = resampleImageToLinear(image, width, height)
+
+  // 遮挡：每像素只回写**最前的不透明层**（参考视角的可见性）。
+  // `occluded[k]` = 「更近的层里已经有 α > 阈值 的像素」的掩码。
+  const occluded: Uint8Array[] = Array.from(
+    { length: L },
+    () => new Uint8Array(pixels),
+  )
+  const front = new Uint8Array(pixels)
+  for (let k = 0; k < L; k++) {
+    occluded[k].set(front)
+    const a = layered.frames[k].alpha
+    for (let i = 0; i < pixels; i++) if (a[i] > OPAQUE_ALPHA) front[i] = 1
+  }
+
+  const foregroundLayers = options.foregroundLayers ?? L
+  const frames: WSplatFrame[] = layered.frames.map((frame, k) => {
+    const weight = computeRefineWeight(frame, {
+      minAlpha: options.minAlpha,
+      smoothnessScale: options.smoothnessScale,
+      smoothnessExponent: options.smoothnessExponent,
+      foreground: k < foregroundLayers,
+      occluded: occluded[k],
+    })
+    const rgb = blendImageWriteback(frame.rgb, imageLinear, weight)
+    // WSplatFrame 是 readonly：用替换引用造新帧，其余字段原样复用。
+    return { ...frame, rgb }
+  })
+
+  return { ...layered, frames }
+}
+
+function srgbToLinear(x: number): number {
+  const c = x < 0 ? 0 : x > 1 ? 1 : x
+  return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4
 }

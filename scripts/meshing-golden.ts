@@ -40,6 +40,7 @@ import {
   compositeLayersBackToFront,
   downscaleAlphaWeighted,
   expandSupportWithMargin,
+  toMeshingInput,
 } from "../src/spatial-scene/meshing/index.ts"
 import {
   computeDisparityField,
@@ -56,7 +57,7 @@ import { createWSplatCamera } from "../src/spatial-scene/wsplat/camera.ts"
 import { createWSplatRenderer } from "../src/spatial-scene/wsplat/index.ts"
 import type { WSplatFrame } from "../src/spatial-scene/wsplat/types.ts"
 import { rasterizeLayerMesh } from "./utils/meshing-cpu.ts"
-import { renderLayerStack, toMeshingInput } from "./utils/meshing-scene.ts"
+import { renderLayerStack } from "./utils/meshing-scene.ts"
 import { withNodeDevice } from "./utils/webgpu.ts"
 import { maskedMae, maskedNcc, toGray } from "./utils/wsplat-metrics.ts"
 import type { WSplatScene } from "./utils/wsplat-scene.ts"
@@ -949,7 +950,7 @@ async function rasterizationChecks(options: {
       layers: options.layers,
       method: options.method,
     })
-    const input = toMeshingInput(scene, stack)
+    const input = toMeshingInput(stack, scene.camera)
     // 严格参考视角度量用**表面**（关裙边/背衬）：裙边会往遮挡缝里铺几何，把那里的深度
     // 换成墙的深度（对“隐藏缝隙”是对的，但不是“表面重现”）。
     const meshScene = buildMeshScene(input, {

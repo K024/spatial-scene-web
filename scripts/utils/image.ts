@@ -65,6 +65,7 @@ export interface SharpPipeline {
     kernel?: string
   }): SharpPipeline
   png(): SharpPipeline
+  jpeg(opts?: { quality?: number }): SharpPipeline
   toBuffer(): Promise<Buffer>
   toFile(path: string): Promise<unknown>
 }

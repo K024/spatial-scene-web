@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "tsc -b && biome check .",
     "format": "biome format --write .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "webui": "tsx scripts/webui.ts"
   },
   "dependencies": {
     "onnxruntime-web": "^1.29.0",
@@ -18,7 +19,11 @@
   },
   "devDependencies": {
     "@babel/core": "^8.0.5",
+    "@backroad/backroad": "^1.20.2",
     "@biomejs/biome": "^2.5.13",
+    "@gltf-transform/core": "^4.5.0",
+    "@gltf-transform/extensions": "^4.5.0",
+    "@gltf-transform/functions": "^4.5.0",
     "@rolldown/plugin-babel": "^0.2.4",
     "@types/babel__core": "^7.20.5",
     "@types/node": "^24.13.3",
@@ -27,6 +32,7 @@
     "@vitejs/plugin-react": "^6.1.1",
     "babel-plugin-react-compiler": "^1.0.0",
     "canvas": "^3.2.3",
+    "draco3d": "^1.5.7",
     "onnxruntime-node": "^1.29.0",
     "sharp": "^0.35.4",
     "tsx": "^4.23.13",

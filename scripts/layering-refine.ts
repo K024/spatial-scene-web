@@ -35,9 +35,9 @@ import { computeLayerPlacement } from "../src/spatial-scene/layering/placement.t
 import {
   blendImageWriteback,
   computeRefineWeight,
+  resampleImageToLinear,
 } from "../src/spatial-scene/layering/refine.ts"
 import type { LayerSamplingMethod } from "../src/spatial-scene/layering/types.ts"
-import type { SourceImage } from "../src/spatial-scene/sharp/preprocess.ts"
 import { createWSplatRenderer } from "../src/spatial-scene/wsplat/index.ts"
 import {
   computeViewDepths,
@@ -150,39 +150,6 @@ function colorMetrics(
   }
 }
 
-/** 原图（sRGB uint8 HWC）双线性重采样到层分辨率 + 线性化，返回 `[n*3]`。 */
-function resampleImageToLinear(
-  src: SourceImage,
-  width: number,
-  height: number,
-): Float32Array {
-  const out = new Float32Array(width * height * 3)
-  const { data, width: sw, height: sh, channels: ch } = src
-  for (let y = 0; y < height; y++) {
-    const fy = ((y + 0.5) * sh) / height - 0.5
-    const y0 = Math.min(sh - 1, Math.max(0, Math.floor(fy)))
-    const y1 = Math.min(sh - 1, y0 + 1)
-    const ty = Math.min(1, Math.max(0, fy - y0))
-    for (let x = 0; x < width; x++) {
-      const fx = ((x + 0.5) * sw) / width - 0.5
-      const x0 = Math.min(sw - 1, Math.max(0, Math.floor(fx)))
-      const x1 = Math.min(sw - 1, x0 + 1)
-      const tx = Math.min(1, Math.max(0, fx - x0))
-      const o = (y * width + x) * 3
-      for (let c = 0; c < 3; c++) {
-        const p00 = data[(y0 * sw + x0) * ch + c]
-        const p10 = data[(y0 * sw + x1) * ch + c]
-        const p01 = data[(y1 * sw + x0) * ch + c]
-        const p11 = data[(y1 * sw + x1) * ch + c]
-        const top = p00 + (p10 - p00) * tx
-        const bot = p01 + (p11 - p01) * tx
-        out[o + c] = srgbToLinear((top + (bot - top) * ty) / 255)
-      }
-    }
-  }
-  return out
-}
-
 /** 线性色 + alpha -> sRGB RGBA8（alpha=0 处置黑）。 */
 function toSrgbRgba(
   rgb: Float32Array,
@@ -218,10 +185,6 @@ function weightRgba(weight: Float32Array): Uint8Array {
 
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v
-}
-function srgbToLinear(x: number): number {
-  const c = clamp01(x)
-  return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4
 }
 function linearToSrgb(x: number): number {
   const c = clamp01(x)

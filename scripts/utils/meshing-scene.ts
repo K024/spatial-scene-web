@@ -1,33 +1,30 @@
 /**
- * layering -> meshing 的**进程内接线**（node 侧）。
- *
- * ── 为什么需要它 ──
- * 本链路约定**不落盘**：层 RGBAD 在进程内从 wsplat 渲染器流到 meshing。
- * 所以「跑一遍完整上游」这件事必须有个唯一入口，否则 `meshing-golden` 与将来的
- * `meshing-render-views` / `meshing-export` 会各抄一份参数（`wsplat-scene.ts` 的同一教训）。
+ * node 侧分层渲染接线（**测试 / golden 专用**，不是交付路径）。
  *
  * ── 做什么 ──
  * ```
  * WSplatScene -> computeViewDepths -> 排序 -> DisparityStats -> LayerPlacement
- *             -> 逐层 drawLayer/readback -> frames[] -> (调用方) buildMeshScene
+ *             -> 逐层 drawLayer/readback -> LayeredRGBD
  * ```
- * 与 `layering-export-layers.ts` 走的是同一条路径（同一个排列、同一份统计），
- * 只是不写 PLY/PNG。
+ * 这是「跑一遍完整上游」的唯一实现，否则 golden / 目测脚本会各抄一份参数
+ *（`wsplat-scene.ts` 的同一教训）。产物 `LayeredRGBD` 交给
+ * `toMeshingInput()`（`src/spatial-scene/meshing/input.ts`）再进 meshing。
+ *
+ * ── 为什么不放 `src/` ──
+ * 它需要装配 PLY 场景（`WSplatScene`，带 `node:fs`）并驱动 WebGPU 渲染器，
+ * 属**测试基准**而非可交付模块。`src/spatial-scene/layering/` 只放平台无关的算法与契约；
+ * 将来补 web 端生成时，若确有共享价值再把它提升到 layering 的公共入口。
  */
 
 import {
   buildLayerPermutation,
+  computeDisparityStats,
+  computeLayerPlacement,
   computeLayerRanges,
+  type LayeredRGBD,
+  type LayerSamplingMethod,
   permuteNdcDepths,
-} from "../../src/spatial-scene/layering/bands.ts"
-import { computeDisparityStats } from "../../src/spatial-scene/layering/disparity-stats.ts"
-import { computeLayerPlacement } from "../../src/spatial-scene/layering/placement.ts"
-import type {
-  DisparityStats,
-  LayerPlacement,
-  LayerSamplingMethod,
-} from "../../src/spatial-scene/layering/types.ts"
-import type { MeshingInput } from "../../src/spatial-scene/meshing/types.ts"
+} from "../../src/spatial-scene/layering/index.ts"
 import { createWSplatRenderer } from "../../src/spatial-scene/wsplat/index.ts"
 import {
   computeViewDepths,
@@ -36,16 +33,7 @@ import {
 import type { WSplatFrame } from "../../src/spatial-scene/wsplat/types.ts"
 import type { WSplatScene } from "./wsplat-scene.ts"
 
-/** 一次分层渲染的产物。 */
-export interface LayeredStack {
-  readonly placement: LayerPlacement
-  readonly stats: DisparityStats
-  /** 逐层 RGBAD，索引与 `placement.layerDepths` 对齐（0 = 最近）。 */
-  readonly frames: WSplatFrame[]
-  /** `[L*2]` 每层视差域范围（含 overlap），= `MXISceneBuilder.getLayerRange(i)` 语义。 */
-  readonly ranges: Float32Array
-}
-
+/** `renderLayerStack` 的旋钮。 */
 export interface RenderLayerStackOptions {
   /** 层数。默认 `8`（出货上界）。 */
   layers?: number
@@ -55,12 +43,17 @@ export interface RenderLayerStackOptions {
   binCount?: number
 }
 
-/** 跑一遍「splat -> L 层 RGBAD」，返回帧与元数据（进程内）。 */
+/**
+ * 跑一遍「splat -> L 层 RGBAD」，返回 `LayeredRGBD`（进程内，不落盘）。
+ *
+ * 渲染器在本函数内创建 / 销毁；`ranges` 用 `overlap = 0`（层间重叠只体现在
+ * `toMeshingInput` 的显式 `overlap` 参数上）。
+ */
 export async function renderLayerStack(
   device: GPUDevice,
   scene: WSplatScene,
   options: RenderLayerStackOptions = {},
-): Promise<LayeredStack> {
+): Promise<LayeredRGBD> {
   const L = options.layers ?? 8
   const method = options.method ?? "quantile"
   const { width, height } = scene
@@ -100,32 +93,14 @@ export async function renderLayerStack(
   renderer.destroy()
 
   return {
-    placement,
-    stats,
-    frames,
-    ranges: computeLayerRanges(placement.boundaries, 0),
-  }
-}
-
-/** 把上面的产物装成 `buildMeshScene` 要的输入契约。 */
-export function toMeshingInput(
-  scene: WSplatScene,
-  stack: LayeredStack,
-  overlap = 0,
-): MeshingInput {
-  return {
-    L: stack.frames.length,
-    width: scene.width,
-    height: scene.height,
+    L,
+    width,
+    height,
     near: scene.near,
     far: scene.far,
-    placement: stack.placement,
-    ranges:
-      overlap === 0
-        ? stack.ranges
-        : computeLayerRanges(stack.placement.boundaries, overlap),
-    frames: stack.frames,
-    stats: stack.stats,
-    camera: scene.camera,
+    placement,
+    ranges: computeLayerRanges(placement.boundaries, 0),
+    frames,
+    stats,
   }
 }

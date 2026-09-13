@@ -54,6 +54,7 @@ export {
   compositeLayersBackToFront,
   downscaleAlphaWeighted,
 } from "./backfill.ts"
+export { toMeshingInput } from "./input.ts"
 export type { MarginResult } from "./margin.ts"
 export { expandSupportWithMargin } from "./margin.ts"
 export type { LayerReliefStats, ReliefFrame } from "./relief.ts"
