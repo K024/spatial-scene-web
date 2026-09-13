@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+*.glb
+
+# web 渲染端的派生资源（由 npm run sync:assets / npm run sample 生成）
+public/draco
+public/models/sample.glb
