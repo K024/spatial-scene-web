@@ -27,6 +27,7 @@ import {
   type LayerCompletionOptions,
   type LayeredRGBD,
   type LayerSamplingMethod,
+  type ResidualWritebackOptions,
   refineLayers,
 } from "../../src/spatial-scene/layering/index.ts"
 import {
@@ -179,6 +180,13 @@ export interface BuildGlbOptions {
    * 需要 `sourceImage`（与 `refine` 同一条件）。
    */
   complete?: LayerCompletionOptions | false
+  /**
+   * 颜色回写是否用**合成残差**（`refineLayers` 的 `residual`，默认 `true`）。
+   * `false` = 旧式逐层混原图色，仅供对照实验。
+   */
+  residual?: boolean
+  /** 残差回写的门（覆盖率下限 / 单次增量上限）。 */
+  writeback?: ResidualWritebackOptions
   /** Draco 压缩几何（默认开）。 */
   draco?: boolean
   /** meshing 选项（含 `lod` 出面）。缺省 = 逐像素出面（百万级）。 */
@@ -242,7 +250,11 @@ export async function buildGlb(
   let layered: LayeredRGBD = base
   let refined = false
   if (options.refine !== false && sourceImage) {
-    layered = refineLayers(base, sourceImage, { complete: options.complete })
+    layered = refineLayers(base, sourceImage, {
+      complete: options.complete,
+      residual: options.residual,
+      writeback: options.writeback,
+    })
     refined = true
   }
 

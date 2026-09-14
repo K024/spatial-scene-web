@@ -308,6 +308,15 @@ export interface LayerMeshReport {
   readonly wallTriangles: number
   /** 实际生效的裙边视差宽度。 */
   readonly skirtDisparity: number
+  /**
+   * LOD 出面：**输出三角面** vs 视差场的最大误差（见 `lod.ts` 的 `LodStats`）。
+   * 逐像素出面（`relief`）路径不填。
+   */
+  readonly maxTriangleError?: number
+  /** LOD 出面：已到 `minCell` 但输出面误差仍超 `maxError` 的叶子数（必须报出来）。 */
+  readonly minCellViolations?: number
+  /** LOD 出面：含贴边外推（snap）顶点、无法用预测面验差的叶子数。 */
+  readonly errorSkippedLeaves?: number
 }
 
 /** 整场诊断。 */

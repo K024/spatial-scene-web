@@ -211,6 +211,9 @@ export function buildMeshScene(
         boundaryEdges: 0,
         wallTriangles: 0,
         skirtDisparity: 0,
+        maxTriangleError: lod.stats.maxTriangleError,
+        minCellViolations: lod.stats.minCellViolations,
+        errorSkippedLeaves: lod.stats.errorSkippedLeaves,
       }
       continue
     }
@@ -252,7 +255,6 @@ export function buildMeshScene(
     camera,
     placement.boundariesZ[L],
     [0, 1],
-    [near, far],
     options.backing,
   )
 

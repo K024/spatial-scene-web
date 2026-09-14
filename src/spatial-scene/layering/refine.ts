@@ -135,6 +135,12 @@ export function computeRefineWeight(
 /**
  * 把原图颜色按权重混进层颜色：`c ← (1−w)·c_splat + w·c_image`。
  *
+ * ⚠ **这不是管线用的回写**（管线走 {@link applyResidualWriteback}）。保留它是为了
+ * 留一个可当单测用的最小混合原语：`w = 1` 时逐位等于原图色。
+ * 逐层混原图色**在两层以上同时贡献的像素上是错的** —— 原图色是「多层合成色」，
+ * 不是任何一层的真色。实测（近层 α=0.6 红 + 远层 α=1 蓝，合成已等于原图）
+ * 旧式按 `w=0.2` 混完，合成偏离原图 0.048；残差式给 0。
+ *
  * 两端都是**直通线性 RGB**（不是 premultiplied），与 `WSplatFrame.rgb` 一致。
  * `w = 0` 时逐位等于层颜色；`w = 1` 时逐位等于原图色（方便当单测）。
  */
@@ -155,11 +161,228 @@ export function blendImageWriteback(
   return out
 }
 
+/** {@link applyResidualWriteback} 的旋钮。 */
+export interface ResidualWritebackOptions {
+  /**
+   * 只在**合成覆盖** `A_total ≥ minCoverage` 的像素回写（默认 `0.9`）。
+   *
+   * 为什么要这门口：残差回写是「把合成推向原图」。若该像素背后还有没被任何层
+   * 表达的背景（`1 − A_total > 0`），把残差全摊到现有层上就等于**把没观测到的背景
+   * 烘进层色**，而且分摊式 `Δc ≈ r/A²` 会把残差**放大** `1/A²` 倍（`A=0.9` ⇒ 1.23×，
+   * `A=0.5` ⇒ 4×）。所以门不能开到很低。
+   *
+   * 实测权衡（768、L=6、`example.ply` + 同相机原图、同一套权重，参考视角 vs 原图）：
+   * ```
+   *   minCoverage  亮度NCC   sRGB MAE  放大 1/A²   （尾部三档完全相同：P99 0.0008、>0.05 占 0.21%）
+   *   0.999        0.9684    0.0100    1.00×
+   *   0.99         0.9850    0.0046    1.02×
+   *   0.90         0.9969    0.0015    1.23×   ← **默认**：两条轴都赢旧式，放大仍温和
+   *   0.50         0.9986    0.0012    4.00×   ← 只多 0.0017 NCC，却把放大推到 4 倍，不值
+   *   旧式(不看覆盖) 0.9949    0.0041    —      ← 它把原图色涂满全图，聚合指标靠"涂到低 α 像素"刷出来
+   * ```
+   * ⇒ `0.9` 是拐点：再放宽收益趋平、代价（烘背景 + 放大）继续涨。
+   * ⚠ 仍未完成的验收：被烘进的那 ≤10% 未观测背景**会不会在侧视里露馅**（发光/第二主体）
+   * —— 参考视角指标看不见它，只能用 `layering-render-views.ts` 或 viewer 侧摆目测。
+   */
+  minCoverage?: number
+  /** 单次回写的颜色上限（默认 `0.25`，防残差过大时整层色被推飞）。 */
+  maxDelta?: number
+  /** 分母正则项（默认 `1e-4`）。 */
+  epsilon?: number
+  /** 诊断输出（可选；`refineLayers` 的 `stats` 会转发到这里）。 */
+  stats?: RefineStats
+}
+
+/**
+ * 残差回写的默认覆盖率门。
+ *
+ * 取值理由与实测表见 {@link ResidualWritebackOptions.minCoverage}：`0.9` 是"两条轴都赢旧式"
+ * 的拐点，且 `1/A²` 放大仍只有 1.23×。**脚本的 CLI 默认值也从这里取**（避免两处漂移）。
+ */
+export const DEFAULT_WRITEBACK_MIN_COVERAGE = 0.9
+
+/** 单次回写的默认颜色上限（防残差过大时整层色被推飞）。 */
+export const DEFAULT_WRITEBACK_MAX_DELTA = 0.25
+
+/** 回写 / 补齐的逐像素诊断（供脚本与调参报告引用；渲染器忽略）。 */
+export interface RefineStats {
+  /** 合成覆盖过门、真正参与回写的像素数。 */
+  writebackCoveredPixels: number
+  /** 其中被 `maxDelta` 限幅的像素数（限幅后合成**到不了**原图）。 */
+  writebackClampedPixels: number
+  /** 其中因层色被夹回 `[0,1]` 而没吃满残差的像素数。 */
+  writebackRangeClippedPixels: number
+  /** 回写后仍残留的合成偏差均值（|Δ|，线性直通域）。 */
+  writebackResidualMean: number
+}
+
+/**
+ * **合成残差回写**：把「合成与原图的差」按各层的边际贡献分回层色。
+ *
+ * ```text
+ * v_k  = (1 − A_{<k})·α_k                # 本层对该像素可见度的边际贡献
+ * C    = Σ v_k·c_k                       # 逐层 over 的直通色（与 viewer 的 BLEND 同语义）
+ * r    = I − C                           # 参考视角残差（线性直通域）
+ * Δc_k = q_k·v_k / (Σ q_j·v_j² + ε) · r
+ * ```
+ *
+ * 性质（`scripts/layering-golden.ts` 的 A0c「残差回写的合成恒等」钉住）：
+ * 1. `Σ v_k·Δc_k ≈ r` ⇒ **回写后逐层 over 合成 == 原图**（在 `A_total` 足够处）；
+ * 2. `r = 0` ⇒ 逐层不动：已经等于原图的像素**不会被写坏**（旧式做不到）；
+ * 3. `q_k = 0`（背景层 / 被遮挡 / 权重低）的层不吃残差，只当贡献者参与分母。
+ *
+ * ── 分摊与限幅（两趟）──
+ * 单趟按 `q·v²` 分摊时，某层可能被推到自己合法范围之外（`[0,1]`）或撞 `maxDelta`，
+ * 那一段残差就**丢了**（α=0.6 红 + α=1 蓝：蓝层被要求减红而它本来就是 0 ⇒ 合成差 8.4e-4）。
+ * 所以按两趟做：第一趟分摊 + 逐层范围检查，夹住的层退出；第二趟把没吃掉的残差给没夹的层。
+ * **限幅仍是尾部的已知来源**（native 实测：约 1.8% 像素撞 `maxDelta`、约 11% 的通道被夹回
+ * `[0,1]`）——那些像素的合成到不了原图；要压它就抬 `maxDelta`，代价是层色被推出合法域。
+ *
+ * @param weights 逐像素置信权重（`computeRefineWeight` 的产物），`q_k`。
+ */
+export function applyResidualWriteback(
+  frames: readonly WSplatFrame[],
+  imageLinear: Float32Array,
+  weights: readonly Float32Array[],
+  options: ResidualWritebackOptions = {},
+): WSplatFrame[] {
+  const L = frames.length
+  if (L === 0) return []
+  const pixels = frames[0].alpha.length
+  const minCoverage = options.minCoverage ?? DEFAULT_WRITEBACK_MIN_COVERAGE
+  const maxDelta = Math.max(0, options.maxDelta ?? DEFAULT_WRITEBACK_MAX_DELTA)
+  const eps = options.epsilon ?? 1e-4
+  const stats = options.stats
+  const { frontBefore, totalAlpha } = computeLayerOwnership(frames, pixels)
+
+  // 逐层残差增量（`Float32Array` 是可选分配：整层 q=0 时不分配）。
+  const deltas: (Float32Array | null)[] = new Array(L).fill(null)
+  const touched: boolean[] = new Array(L).fill(false)
+  const v = new Float32Array(L)
+  const q = new Float32Array(L)
+  /** 逐像素的「本层还愿意吃残差吗」（复用，避免每像素分配）。 */
+  const active = new Uint8Array(L)
+  for (let i = 0; i < pixels; i++) {
+    const A = totalAlpha[i]
+    if (!(A >= minCoverage)) continue
+    if (stats) stats.writebackCoveredPixels++
+    // 本像素过门 ⇒ 逐层算 v_k / q_k。
+    let denom = eps
+    for (let k = 0; k < L; k++) {
+      const frame = frames[k]
+      const ek = (1 - frontBefore[k][i]) * frame.alpha[i]
+      const wk = weights[k]?.[i] ?? 0
+      v[k] = ek
+      q[k] = wk
+      denom += wk * ek * ek
+    }
+    const o = i * 3
+    let r0 = imageLinear[o]
+    let r1 = imageLinear[o + 1]
+    let r2 = imageLinear[o + 2]
+    for (let k = 0; k < L; k++) {
+      const ek = v[k]
+      if (!(ek > 0)) continue
+      const rgb = frames[k].rgb
+      r0 -= ek * rgb[o]
+      r1 -= ek * rgb[o + 1]
+      r2 -= ek * rgb[o + 2]
+    }
+    if (Math.abs(r0) + Math.abs(r1) + Math.abs(r2) <= 1e-7) continue
+
+    // 两趟：第一趟按 q·v² 分摊（每层都做范围检查），被夹住的层退出；
+    // 第二趟把没吃掉的残差交给剩下没夹的层。只用一趟时，"某层被推到自己合法范围之外"
+    // 会让那段残差直接丢失（实测 8.4e-4 的合成差就来自这里）。
+    for (let k = 0; k < L; k++) {
+      active[k] = q[k] > 0 && v[k] > 0 ? 1 : 0
+    }
+    let anyClamped = false
+    for (let pass = 0; pass < 2; pass++) {
+      let denom = eps
+      let survivors = 0
+      for (let k = 0; k < L; k++) {
+        if (!active[k]) continue
+        denom += q[k] * v[k] * v[k]
+        survivors++
+      }
+      if (survivors === 0) break
+      for (let k = 0; k < L; k++) {
+        if (!active[k]) continue
+        const scale = (q[k] * v[k]) / denom
+        const delta = deltas[k] ?? new Float32Array(pixels * 3)
+        deltas[k] = delta
+        touched[k] = true
+        const rgb = frames[k].rgb
+        let clipped = false
+        let got0 = 0
+        let got1 = 0
+        let got2 = 0
+        for (let c = 0; c < 3; c++) {
+          const want = clampAbs(
+            scale * (c === 0 ? r0 : c === 1 ? r1 : r2),
+            maxDelta,
+          )
+          const base = rgb[o + c] + delta[o + c]
+          const next = Math.min(1, Math.max(0, base + want))
+          const got = next - base
+          if (Math.abs(got - want) > 1e-7) clipped = true
+          delta[o + c] += got
+          if (c === 0) got0 = got
+          else if (c === 1) got1 = got
+          else got2 = got
+        }
+        r0 -= v[k] * got0
+        r1 -= v[k] * got1
+        r2 -= v[k] * got2
+        if (clipped) {
+          active[k] = 0
+          anyClamped = true
+        }
+      }
+      if (Math.abs(r0) + Math.abs(r1) + Math.abs(r2) <= 1e-7) break
+    }
+    if (anyClamped && stats) {
+      stats.writebackClampedPixels++
+      // 两趟之后仍没吃掉的残差（线性直通域，三通道平均）
+      stats.writebackResidualMean +=
+        (Math.abs(r0) + Math.abs(r1) + Math.abs(r2)) / 3
+    }
+  }
+
+  if (stats && stats.writebackCoveredPixels > 0) {
+    stats.writebackResidualMean /= stats.writebackCoveredPixels
+  }
+  // 增量已在分摊时按 [0,1] 与 maxDelta 夹过，这里只做写出（不再夹一次）。
+  return frames.map((frame, k) => {
+    const delta = deltas[k]
+    if (!delta || !touched[k]) return frame
+    const rgb = Float32Array.from(frame.rgb)
+    let clipped = 0
+    for (let i = 0; i < rgb.length; i++) {
+      const v = rgb[i] + delta[i]
+      if (v < 0 || v > 1) clipped++
+      rgb[i] = Math.min(1, Math.max(0, v))
+    }
+    if (stats && clipped > 0) stats.writebackRangeClippedPixels += clipped
+    return { ...frame, rgb }
+  })
+}
+
+function clampAbs(v: number, limit: number): number {
+  return v > limit ? limit : v < -limit ? -limit : v
+}
+
 /**
  * 层像素 -> 原图像素（浮点坐标，给小采样器用）。
  *
  * 参考相机 == 原图相机 ⇒ 映射是**恒等 + 分辨率缩放**（见文件头）。
  * 返回值已加 `+0.5 / −0.5` 的像素中心约定，方便直接双线性插值。
+ *
+ * ⚠ **前提必须成立**：层渲染相机与原图相机是同一套内参（像素焦距 + 主点 + 画幅）。
+ * 若上游改成「用更大的画布 FOV 渲染分层、最后裁回有效视口」（Apple 头文件里
+ * `effectiveFovInRadians` / `effectiveAspectRatio` / `trimmedColorTexture` 提示这种可能），
+ * 这里必须换成 **crop/UV 变换**，否则回写、纹理 UV、mesh 反投影、viewer 相机会各用一套口径，
+ * 表现为参考视角缩放或半像素错位。**尚未实现**，先别把假设当契约。
  */
 export function layerPixelToImagePixel(
   x: number,
@@ -179,8 +402,17 @@ export function layerPixelToImagePixel(
  * hidden 边界外推的旋钮。
  *
  * 语义：把本层表面从**已有覆盖**向外（屏幕空间）延伸到被更近层遮挡的区域，
- * 产出连续的 `(rgb, depth, α)`。算法与选型见
- * `temp/REPORT_layering_occlusion_fill.md` 的「补篇 B」。
+ * 产出连续的 `(rgb, depth, α)`。
+ *
+ * ── 为什么是这个形状（选型结论，别改成「洞的面积」那一套）──
+ * 1. **判据用几何**：遮挡关系（更近层的累积 α）+ 到本层覆盖的距离 + 本层深度带夹紧。
+ *    不看洞的面积 —— 大面积但**贴边**的遮挡区照样要补（现实里的遮挡都是贴边的），
+ *    而远离覆盖的深处空洞不补（那是背衬平面的活）。
+ * 2. **有界 + 带夹紧**：`maxDistancePx` 限距、深度夹到本层带 ⇒ 不会穿到遮挡物前面。
+ * 3. **只写 hidden 像素**：目标掩码要求`A_{<k} ≥ minFrontAlpha`（默认 0.999，参考视角
+ *    **完全**遮挡）⇒ 参考视角逐位不变，外推结果不会泄漏到原图视角。
+ * 4. **默认只补几何（depth-only）**：不动 RGB/α，保留原纹理的渐隐；要填色得显式开
+ *    {@link HiddenExtendOptions.rgba}（dilate + 距离衰减）。
  */
 export interface HiddenExtendOptions {
   /**
@@ -241,6 +473,13 @@ export interface LayerCompletionOptions {
   fillAlpha?: number
   /** 支撑判定用的 α 门（与 meshing 的支撑语义一致）。默认 `0.5`。 */
   supportAlpha?: number
+  /**
+   * 「洞」两钳口深度一致的**相对**容差（默认 `0.2`）。
+   *
+   * 只补**同一张表面上的洞**：两侧支撑的深度差超过 `tol·min(z)` 就当成两张不同的面
+   * （阶梯、栏杆间隙），不补 —— 否则会把真实的深度断口糊成一张布。
+   */
+  holeDepthTolerance?: number
 }
 
 /** 整摞回写的旋钮 = 逐层权重因子 + 回写层范围 + 几何补齐。 */
@@ -259,6 +498,17 @@ export interface RefineLayersOptions extends RefineWeightOptions {
    * `accumulatedDepth` / `visible`，不只是 `rgb`。这是与旧版的关键差异。
    */
   complete?: LayerCompletionOptions | false
+  /**
+   * 颜色回写用**合成残差**（默认 `true`）。
+   *
+   * `false` = 旧行为（逐层按权重混原图色）—— 两层以上同时贡献的像素上会把已经
+   * 正确的合成**写坏**（见 `blendImageWriteback` 的注释）。留这个开关只为做对照实验。
+   */
+  residual?: boolean
+  /** 残差回写的门（覆盖率下限 / 单次增量上限）。 */
+  writeback?: ResidualWritebackOptions
+  /** 诊断输出对象（可选）：回写覆盖数、限幅数、残留均值。 */
+  stats?: RefineStats
 }
 
 /** 逐像素「已被更近的不透明层覆盖」的判定阈值（与回写权重的 `minAlpha` 默认值一致）。 */
@@ -314,6 +564,57 @@ export function compositeAlphaDepth(
     depth[i] = alpha[i] > 1e-6 ? ed[i] / alpha[i] : 0
   }
   return { alpha, depth }
+}
+
+/** 逐层深度矩自洽性的体检结果（见 {@link layerMomentResidual}）。 */
+export interface MomentResidual {
+  /**
+   * 最大相对残差 `|ED − A·D| / max(|ED|, |A·D|, eps)`。
+   *
+   * 逐层像素的 `depth` 是渲染期 α 加权期望深度 `D = ED/A`，所以 `ED == A·D` 是
+   * **表示层的不变量**：谁改了 `depth`（或 `α`）谁就必须同步 `accumulatedDepth`，
+   * 否则下游 `compositeAlphaDepth` / mesh 用的合成深度就是陈旧值。
+   */
+  readonly maxRel: number
+  /** 相对残差 > 容差的像素数。 */
+  readonly violations: number
+  /** 残差最大处的层号（`-1` = 无）。 */
+  readonly worstLayer: number
+}
+
+/**
+ * 逐层检查 `ED == A·D`（几何补齐之后必须仍然成立）。
+ *
+ * 阈值口径：`A` 存在 f16 附件里，`ED` 是 f32，所以不变量本身有 `f16_ulp(A) ≈ 5e-4`
+ * 的固有相对误差；默认容差 `2e-3`（4 倍余量）。只统计 `α ≥ alphaFloor` 的像素
+ * （α 极小的像素没有几何意义，相对误差会被放大成噪声）。
+ */
+export function layerMomentResidual(
+  frames: readonly Pick<WSplatFrame, "alpha" | "depth" | "accumulatedDepth">[],
+  options: { relTolerance?: number; alphaFloor?: number } = {},
+): MomentResidual {
+  const tol = options.relTolerance ?? 2e-3
+  const alphaFloor = options.alphaFloor ?? 0.05
+  let maxRel = 0
+  let violations = 0
+  let worstLayer = -1
+  for (let k = 0; k < frames.length; k++) {
+    const { alpha, depth, accumulatedDepth } = frames[k]
+    for (let i = 0; i < alpha.length; i++) {
+      const a = alpha[i]
+      if (!(a >= alphaFloor)) continue
+      const want = a * depth[i]
+      const got = accumulatedDepth[i]
+      const denom = Math.max(Math.abs(want), Math.abs(got), 1e-6)
+      const rel = Math.abs(got - want) / denom
+      if (rel > maxRel) {
+        maxRel = rel
+        worstLayer = k
+      }
+      if (rel > tol) violations++
+    }
+  }
+  return { maxRel, violations, worstLayer }
 }
 
 /**
@@ -419,6 +720,7 @@ export function completeLayerGeometry(
   const fillAlpha = options.fillAlpha
   const doOwn = options.ownGap !== false
   const holeRadius = Math.max(1, Math.floor(options.holeRadiusPx ?? 2))
+  const holeDepthTol = Math.max(0, options.holeDepthTolerance ?? 0.2)
   const hidden =
     options.hidden === false
       ? null
@@ -444,9 +746,24 @@ export function completeLayerGeometry(
   )
 
   // ── ① own-gap：本层该负责的前表面**小洞** → 用本层边缘的色/深/α 补（不发明 α）──
-  // 两个门：距本层支撑 ≤ `holeRadiusPx`（小洞）+ 被支撑**夹在两侧**（洞，不是边缘外点）。
-  // 色/深/α 全部取最近支撑像素 —— 与旧 `meshing/margin.ts` 的 `source` 同语义。
+  // 门：距本层支撑 ≤ `holeRadiusPx`（小洞）+ 被**同表面**支撑夹在两侧（洞，不是边缘外点）。
+  // 两条认领路径（缺一不可）：
+  //   a) **有主**：合成可见（`A > τ`）且 α 归属是本层（旧路径，补「本层是前表面但 α 偏低」）；
+  //   b) **无主**：合成 `A` 本来就低、本层之前没有更近的支撑、**本层之后再没有可观测支撑**
+  //      ⇒ 这是「所有层都没画出来」的采样洞（零 α 洞），本层按同表面邻域认领。
+  //      b 的第三项是「别把真间隙填死」的关键：栏杆/结构间隙背后**看得见东西**（更远层有
+  //      支撑），那种洞不许填；只有背后什么都没有的洞才是渲染丢的采样洞。
   if (doOwn) {
+    // `supportedFrom[k][i]` = 层 `k..L−1` 里是否存在 α ≥ τ 的支撑。
+    const supportedFrom: Uint8Array[] = new Array(L + 1)
+    supportedFrom[L] = new Uint8Array(pixels)
+    for (let k = L - 1; k >= 0; k--) {
+      const prev = supportedFrom[k + 1]
+      const cur = Uint8Array.from(prev)
+      const a = frames[k].alpha
+      for (let i = 0; i < pixels; i++) if (a[i] >= supportAlpha) cur[i] = 1
+      supportedFrom[k] = cur
+    }
     for (let k = 0; k < L; k++) {
       const f = frames[k]
       const bandLo = boundariesZ[k]
@@ -463,14 +780,29 @@ export function completeLayerGeometry(
       let changed = false
       for (let i = 0; i < pixels; i++) {
         if (f.alpha[i] >= supportAlpha) continue
-        if (!(totalAlpha[i] > supportAlpha)) continue
-        if (owner[i] !== k) continue
+        const visible = totalAlpha[i] > supportAlpha
+        const owned = visible && owner[i] === k
+        const unobserved =
+          !visible &&
+          !(frontBefore[k][i] >= supportAlpha) &&
+          supportedFrom[k + 1][i] === 0
+        if (!owned && !unobserved) continue
         const s = ns.src[i]
         if (s < 0) continue
         const x = i % width
         const y = (i / width) | 0
         if (
-          !isEnclosed(f.alpha, x, y, width, height, supportAlpha, holeRadius)
+          !isEnclosedSameSurface(
+            f.alpha,
+            f.depth,
+            x,
+            y,
+            width,
+            height,
+            supportAlpha,
+            holeRadius,
+            holeDepthTol,
+          )
         ) {
           continue
         }
@@ -480,11 +812,7 @@ export function completeLayerGeometry(
         e.rgb[o + 1] = imageLinear[o + 1]
         e.rgb[o + 2] = imageLinear[o + 2]
         const a = fillAlpha ?? e.alpha[s]
-        e.depth[i] = clamp(e.depth[s], bandLo, bandHi)
-        e.alpha[i] = a
-        e.transmission[i] = 1 - a
-        e.accumulatedDepth[i] = a * e.depth[i]
-        e.visible[i] = 1
+        writePixelState(e, i, clamp(e.depth[s], bandLo, bandHi), a)
         changed = true
       }
       if (changed) out[k] = { ...frames[k], ...editable[k]! }
@@ -615,22 +943,25 @@ function extendHiddenBoundary(
     if (!filled[i]) continue
     filledCount++
     const s = src[i]
-    e.depth[i] = clamp(e.depth[s], p.bandLo, p.bandHi)
-    e.visible[i] = 1
-    if (!p.writeRgb) continue
-    const ownAlpha = e.alpha[i]
-    const dilated = e.alpha[s] * (1 - dist[i] / decayDenom)
-    const a = p.fillAlpha ?? Math.min(1, Math.max(ownAlpha, dilated))
-    if (ownAlpha <= 0) {
-      const o = i * 3
-      const so = s * 3
-      e.rgb[o] = e.rgb[so]
-      e.rgb[o + 1] = e.rgb[so + 1]
-      e.rgb[o + 2] = e.rgb[so + 2]
+    const z = clamp(e.depth[s], p.bandLo, p.bandHi)
+    let a = e.alpha[i]
+    if (p.writeRgb) {
+      const ownAlpha = e.alpha[i]
+      const dilated = e.alpha[s] * (1 - dist[i] / decayDenom)
+      a = p.fillAlpha ?? Math.min(1, Math.max(ownAlpha, dilated))
+      if (ownAlpha <= 0) {
+        const o = i * 3
+        const so = s * 3
+        e.rgb[o] = e.rgb[so]
+        e.rgb[o + 1] = e.rgb[so + 1]
+        e.rgb[o + 2] = e.rgb[so + 2]
+      }
     }
-    e.alpha[i] = a
-    e.transmission[i] = 1 - a
-    e.accumulatedDepth[i] = a * e.depth[i]
+    // 统一像素写入口：depth / α / transmission / ED 一次写齐。
+    // `ED = α·depth` 是**表示层的不变量**（`depth` 是渲染期 α 加权期望深度 `ED/A`）：
+    // depth-only 的 hidden 外推也必须同步 ED，否则合成深度 `ΣED/ΣA` 用的是陈旧值
+    // （实测：α=0.2、D=1.2→2.5 时 ED 停在 0.24，合成 D 报 1.2，而真值 2.5）。
+    writePixelState(e, i, z, a)
   }
   if (filledCount === 0) return 0
 
@@ -659,8 +990,7 @@ function extendHiddenBoundary(
       }
       if (wSum <= 0) continue
       const z = clamp(dSum / wSum, p.bandLo, p.bandHi)
-      e.depth[i] = z
-      if (p.writeRgb) e.accumulatedDepth[i] = e.alpha[i] * z
+      writePixelState(e, i, z, e.alpha[i])
     }
   }
   return filledCount
@@ -668,6 +998,26 @@ function extendHiddenBoundary(
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v
+}
+
+/**
+ * 逐像素状态的**唯一写入口**：`depth` / `α` / `transmission` / `accumulatedDepth` 一次写齐。
+ *
+ * 存在的理由：这三个量不是独立的（`transmission = 1−α`、`ED = α·D`），
+ * 分散地写就会出现「改了 D、忘了 ED」这类不一致 —— 而且**只在部分路径上**发生
+ * （hidden 的 depth-only 分支），`layering-golden` 的 28 条门当时全绿。
+ */
+function writePixelState(
+  e: EditableFrame,
+  i: number,
+  depth: number,
+  alpha: number,
+): void {
+  e.depth[i] = depth
+  e.alpha[i] = alpha
+  e.transmission[i] = 1 - alpha
+  e.accumulatedDepth[i] = alpha * depth
+  e.visible[i] = 1
 }
 
 /**
@@ -718,26 +1068,41 @@ function nearestSupportSource(
 }
 
 /**
- * 「洞」判据：沿某一轴的两侧 `radius` 内**都有**支撑。
- * 只在一侧有支撑 = 边缘外点（正是旧 own-gap 在外缘画出 `α=1` 硬点的那种像素），不补。
+ * 「洞」判据：沿某一轴的两侧 `radius` 内**都有同表面**支撑。
+ *
+ * 两条：
+ * 1. 只在一侧有支撑 = 边缘外点（正是旧 own-gap 在外缘画出 `α=1` 硬点的那种像素），不补；
+ * 2. 两侧都有支撑、但深度差超过 `depthTol·min(z)` ⇒ 这是**两个不同表面之间**的真实开口
+ *    （栏杆间隙、台阶、层内断层），不补 —— 补了就是把深度断口糊成一张布。
  */
-function isEnclosed(
+function isEnclosedSameSurface(
   alpha: Float32Array,
+  depth: Float32Array,
   x: number,
   y: number,
   width: number,
   height: number,
   supportAlpha: number,
   radius: number,
+  depthTol: number,
 ): boolean {
   const along = (dx: number, dy: number): boolean => {
+    let near = -1
+    let far = -1
     for (let s = 1; s <= radius; s++) {
       const xx = x + dx * s
       const yy = y + dy * s
       if (xx < 0 || xx >= width || yy < 0 || yy >= height) return false
-      if (alpha[yy * width + xx] >= supportAlpha) return true
+      const j = yy * width + xx
+      if (alpha[j] < supportAlpha || !(depth[j] > 0)) continue
+      if (near < 0) near = depth[j]
+      else far = depth[j]
+      if (far > 0) break
     }
-    return false
+    if (near < 0 || far < 0) return false
+    const lo = Math.min(near, far)
+    const hi = Math.max(near, far)
+    return hi - lo <= depthTol * Math.max(1e-6, lo)
   }
   return (along(-1, 0) && along(1, 0)) || (along(0, -1) && along(0, 1))
 }
@@ -783,8 +1148,12 @@ export function resampleImageToLinear(
 /**
  * 对整摞层做「原图回写 + 几何补齐」，返回**新的一摞**。
  *
- * 流程：原图重采样到层分辨率 → 逐层遮挡掩码 → 逐层算权重并混合颜色
- * → （可选）own-gap 回填 + hidden 边界外推。
+ * 流程：原图重采样到层分辨率 → （可选）**几何补齐**（own-gap + hidden）
+ * → 逐层遮挡掩码 → 逐层权重 → **合成残差回写**。
+ *
+ * ⚠ **补齐必须排在回写之前**：残差回写的覆盖率门 `A_total ≥ minCoverage` 要用
+ * **最终**的 α。先回写再补齐的话，own-gap 会把 α 抬到 1，那些像素从没被回写过，
+ * 「覆盖满 ⇒ 合成 == 原图」这条性质就不成立（实测这类像素正是残差尾部的来源）。
  *
  * ⚠ 颜色回写只在参考视角成立；几何补齐改 `depth`/`alpha`，会改变「合成 == 全量」的
  * 恒等（这是有意的：它补的是全量渲染本身就缺的背景）。是否开启由调用方决定。
@@ -800,11 +1169,24 @@ export function refineLayers(
   const pixels = width * height
   const imageLinear = resampleImageToLinear(image, width, height)
 
-  // 遮挡：每像素只回写**最前的不透明层**（参考视角的可见性）。
-  const occluded = computeOcclusionMasks(layered.frames, pixels)
+  // ① 几何补齐（own-gap + hidden）：先改 α/depth，回写的覆盖率门才看得到最终 α。
+  const completed: readonly WSplatFrame[] =
+    options.complete === false
+      ? layered.frames
+      : completeLayerGeometry(
+          layered.frames,
+          layered.placement,
+          imageLinear,
+          width,
+          height,
+          options.complete ?? {},
+        )
+
+  // ② 遮挡：每像素只回写**最前的不透明层**（参考视角的可见性）。
+  const occluded = computeOcclusionMasks(completed, pixels)
 
   const foregroundLayers = options.foregroundLayers ?? L
-  const colorRefined: WSplatFrame[] = layered.frames.map((frame, k) => {
+  const weights: Float32Array[] = completed.map((frame, k) => {
     const weight = computeRefineWeight(frame, {
       minAlpha: options.minAlpha,
       smoothnessScale: options.smoothnessScale,
@@ -812,24 +1194,21 @@ export function refineLayers(
       foreground: k < foregroundLayers,
       occluded: occluded[k],
     })
-    const rgb = blendImageWriteback(frame.rgb, imageLinear, weight)
-    // WSplatFrame 是 readonly：用替换引用造新帧，其余字段原样复用。
-    return { ...frame, rgb }
+    return weight
   })
-
-  if (options.complete === false) {
-    return { ...layered, frames: colorRefined }
-  }
-
-  const completed = completeLayerGeometry(
-    colorRefined,
-    layered.placement,
-    imageLinear,
-    width,
-    height,
-    options.complete ?? {},
-  )
-  return { ...layered, frames: completed }
+  // 合成残差回写：`Σ v_k·Δc_k ≈ I − C`，所以**参考视角逐层 over 合成 == 原图**，
+  // 且 `r = 0` 的像素逐位不动（旧的逐层混色会把已对的像素写坏）。
+  const colorRefined: WSplatFrame[] =
+    options.residual === false
+      ? completed.map((frame, k) => ({
+          ...frame,
+          rgb: blendImageWriteback(frame.rgb, imageLinear, weights[k]),
+        }))
+      : applyResidualWriteback(completed, imageLinear, weights, {
+          ...options.writeback,
+          stats: options.stats ?? options.writeback?.stats,
+        })
+  return { ...layered, frames: colorRefined }
 }
 
 function srgbToLinear(x: number): number {

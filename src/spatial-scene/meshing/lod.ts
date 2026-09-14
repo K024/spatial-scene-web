@@ -86,6 +86,43 @@ export interface LodStats {
   readonly levelHistogram: readonly number[]
   /** 因 2:1 松弛而额外细分的次数。 */
   readonly balanceSplits: number
+  /**
+   * **输出三角面** vs 视差场的最大误差（像素域视差）。
+   *
+   * 这是对最终几何（含中点缝合、含翻对角）验差的实测值 —— `maxError` 才是门。
+   * cell 边长 > 64px 时按步长抽样（见 `polygonFanError` 的 `stride` 注释），
+   * 小 cell 是全像素验。**权威判定在 `scripts/meshing-golden.ts` 的 A11**（全像素、独立实现）。
+   */
+  readonly maxTriangleError: number
+  /**
+   * 顶点贴边界（无支撑角点 snap 到邻域）而**无法用预测面验差**的叶子数。
+   *
+   * 这是本模块**最大的诚实性缺口**：snap 圈上的几何顶点位置取自邻域支撑像素、UV 仍用自己的
+   * 像素，它本来就不该用视差场判对错。native 实测这个数是 **1 万–22 万片叶子**（随 `minCell`
+   * 与是否开 snap 变化），量级和受验叶子相当 —— 所以「误差有界」只能声明在**受验**的那部分上。
+   */
+  readonly errorSkippedLeaves: number
+  /**
+   * 已到 `minCell` 但输出面误差仍 > `maxError` 的叶子数 —— **必须报出来**。
+   *
+   * 到了最小格子就不能再细分，此时「误差有界」不成立；让调用方知道有多少格子超差，
+   * 而不是继续把它当作「全局误差有界」。
+   *
+   * ⚠ **能到的精度由 `minCell` 决定，不是由 `maxError` 决定**（`example.ply` @ native
+   * 3024×2268、L=6、`snapBoundary=false` 实测）：
+   * ```
+   *   minCell=1 e=0.002 → 输出面误差 0.00200、超差 0         （maxError 真的是界）
+   *   minCell=2 e=0.002 → 0.03496、超差 55,967   e=0.02 → 超差 22
+   *   minCell=4 e=0.002 → 0.05565、超差 58,157   e=0.02 → 超差 324
+   *   minCell=8 e=0.002 → 0.06502、超差 32,748   e=0.02 → 超差 590
+   * ```
+   * 读法：2–16px 的格子里本来就没有「三条边拟合得出」的曲面，所以精度下限跟着 `minCell` 走；
+   * 而**超差计数**同时取决于场在该尺度上的粗糙程度（同样是 `minCell=2`，`e=0.002` 超差 5.6 万、
+   * `e=0.02` 只剩 22）。⇒ 门要写成 `minCell × maxError` 的**联合声明**。
+   */
+  readonly minCellViolations: number
+  /** 未到 `minCell` 却仍超差的叶子数（正常应为 0 —— 说明验差没驱动细分）。 */
+  readonly overErrorLeaves: number
 }
 
 export interface LodMeshResult {
@@ -111,6 +148,8 @@ const DEFAULT_MAX_ERROR = 0.005
 class VertexPool {
   readonly positions: number[] = []
   readonly uvs: number[] = []
+  /** 顶点 id -> 所属像素 `(x, y)`（验差要用回像素坐标）。 */
+  readonly pixelCoord: number[] = []
   private readonly index = new Map<number, number>()
   private readonly width: number
   private readonly height: number
@@ -171,6 +210,7 @@ class VertexPool {
     // UV 永远取**顶点自己的像素**（不是源像素）：无支撑处纹理 α 本来就低，
     // 扩出来的几何被 alpha 自动掩掉，剪影由全分辨率纹理决定。
     this.uvs.push((x + 0.5) / this.width, (y + 0.5) / this.height)
+    this.pixelCoord.push(x, y)
     this.index.set(key, id)
     return id
   }
@@ -274,38 +314,66 @@ export function buildLayerReliefLod(
     return false
   }
 
-  /** 区域是否可整块作为叶子：整块支撑、无撕裂、双线性视差拟合在误差内。 */
-  const regionClean = (x0: number, y0: number, s: number): boolean => {
-    const x1 = x0 + s
-    const y1 = y0 + s
-    if (x1 > width - 1 || y1 > height - 1) return false
-    if (sumSupport(x0, y0, x1, y1) !== (s + 1) * (s + 1)) return false
+  /**
+   * cell 的**合法矩形**：`x1 = min(x0+s, width−1)`、`y1 = min(y0+s, height−1)`。
+   *
+   * 末格必须**裁剪**到这个矩形，而不是整格丢弃。旧实现要求 `x0+s ≤ width−1`，
+   * 于是尺寸不是 `minCell` 整数倍的图会把最右/最下一整条带掉光：
+   * 实测 8×8 满支撑 + `minCellPx=4` 只出 1 个叶子 / 2 个三角，最远只盖到像素坐标 4，
+   * 后 39/64 个像素**没有任何几何**（轮廓处直接露底）。
+   */
+  const cellRect = (
+    x0: number,
+    y0: number,
+    s: number,
+  ): { x0: number; y0: number; x1: number; y1: number } => ({
+    x0,
+    y0,
+    x1: Math.min(x0 + s, width - 1),
+    y1: Math.min(y0 + s, height - 1),
+  })
+
+  /**
+   * 区域是否可整块作为叶子：整块支撑、无撕裂、**输出三角面**的视差误差在门内。
+   *
+   * ⚠ 误差必须按**实际输出的曲面**（两三角分片线性）验，不能按四角双线性验。
+   * 双线性鞍面 `n = 0.5 + a·u·v` 的双线性拟合误差**恒为 0**，而它对应的两三角曲面
+   * 在格中心偏差 `a/4`：旧实现因此在鞍面上放行任意大的格子（实测 64×64、
+   * `maxError=0.005`、`a=0.1` 时，输出三角面的真实视差误差 0.0258）。
+   * 两种对角都验（出面按 3D 对角线择一，两条都在门内就不必知道选了哪条）。
+   */
+  const regionClean = (
+    x0: number,
+    y0: number,
+    x1: number,
+    y1: number,
+  ): boolean => {
+    if (x1 <= x0 || y1 <= y0) return false
+    const rw = x1 - x0 + 1
+    const rh = y1 - y0 + 1
+    if (sumSupport(x0, y0, x1, y1) !== rw * rh) return false
     if (hasTear(x0, y0, x1, y1)) return false
-    const n00 = disparity[y0 * width + x0]
-    const n10 = disparity[y0 * width + x1]
-    const n01 = disparity[y1 * width + x0]
-    const n11 = disparity[y1 * width + x1]
-    const inv = 1 / s
-    for (let y = y0; y <= y1; y++) {
-      const ty = (y - y0) * inv
-      for (let x = x0; x <= x1; x++) {
-        const tx = (x - x0) * inv
-        const bil =
-          n00 * (1 - tx) * (1 - ty) +
-          n10 * tx * (1 - ty) +
-          n01 * (1 - tx) * ty +
-          n11 * tx * ty
-        if (Math.abs(disparity[y * width + x] - bil) > maxError) return false
-      }
+    const corners = {
+      n00: disparity[y0 * width + x0],
+      n10: disparity[y0 * width + x1],
+      n01: disparity[y1 * width + x0],
+      n11: disparity[y1 * width + x1],
     }
-    return true
+    const rect = { x0, y0, x1, y1 }
+    return (
+      fanError(rect, corners, false, disparity, width, support) <= maxError &&
+      fanError(rect, corners, true, disparity, width, support) <= maxError
+    )
   }
 
-  /** min cell 的判据：无撕裂 + （贴边界时）cell 内有支撑 / （不贴时）四角支撑。 */
-  const minCellClean = (x0: number, y0: number, s: number): boolean => {
-    const x1 = x0 + s
-    const y1 = y0 + s
-    if (x1 > width - 1 || y1 > height - 1) return false
+  /** min cell 的判据：合法矩形 + 无撕裂 + （贴边界时）cell 内有支撑 / （不贴时）四角支撑。 */
+  const minCellClean = (
+    x0: number,
+    y0: number,
+    x1: number,
+    y1: number,
+  ): boolean => {
+    if (x1 <= x0 || y1 <= y0) return false
     if (hasTear(x0, y0, x1, y1)) return false
     if (snapBoundary) return sumSupport(x0, y0, x1, y1) > 0
     return (
@@ -329,15 +397,14 @@ export function buildLayerReliefLod(
     parent: Node | null,
   ): Node | null => {
     if (x0 > width - 1 || y0 > height - 1) return null
-    const x1 = Math.min(x0 + s, width - 1)
-    const y1 = Math.min(y0 + s, height - 1)
-    if (x1 < x0 || y1 < y0) return null
+    const { x1, y1 } = cellRect(x0, y0, s)
+    if (x1 <= x0 || y1 <= y0) return null
     if (sumSupport(x0, y0, x1, y1) === 0) return null
-    if (s <= maxCell && regionClean(x0, y0, s)) {
+    if (s <= maxCell && regionClean(x0, y0, x1, y1)) {
       return { x0, y0, s, children: null, parent }
     }
     if (s <= minCell) {
-      return minCellClean(x0, y0, s)
+      return minCellClean(x0, y0, x1, y1)
         ? { x0, y0, s, children: null, parent }
         : null
     }
@@ -366,6 +433,10 @@ export function buildLayerReliefLod(
         triangleCount: 0,
         levelHistogram: [],
         balanceSplits: 0,
+        maxTriangleError: 0,
+        errorSkippedLeaves: 0,
+        minCellViolations: 0,
+        overErrorLeaves: 0,
       },
     }
   }
@@ -396,12 +467,14 @@ export function buildLayerReliefLod(
   /** 该叶子是否存在「小 2 级以上的邻居」（需要细分）。 */
   const hasThinNeighbor = (leaf: Node): boolean => {
     const { x0, y0, s } = leaf
-    const h = s >> 1
+    const { x1, y1 } = cellRect(x0, y0, s)
+    const mx = (x0 + x1) >> 1
+    const my = (y0 + y1) >> 1
     const probes: Array<[number, number]> = [
-      [x0 + s, y0 + h],
-      [x0 - 1, y0 + h],
-      [x0 + h, y0 + s],
-      [x0 + h, y0 - 1],
+      [x1, my],
+      [x0 - 1, my],
+      [mx, y1],
+      [mx, y0 - 1],
     ]
     for (const [px, py] of probes) {
       if (px < 0 || py < 0 || px >= width || py >= height) continue
@@ -411,63 +484,134 @@ export function buildLayerReliefLod(
     return false
   }
 
-  let balanceSplits = 0
-  for (let iter = 0; iter < 12; iter++) {
-    const leaves: Node[] = []
-    collectLeaves(root, leaves)
-    const thin = leaves.filter(hasThinNeighbor)
-    if (thin.length === 0) break
-    for (const leaf of thin) {
-      const parent = leaf.parent
-      const h = leaf.s >> 1
-      const node: Node = {
-        x0: leaf.x0,
-        y0: leaf.y0,
-        s: leaf.s,
-        children: [],
-        parent,
-      }
-      const kids = [
-        build(leaf.x0, leaf.y0, h, node),
-        build(leaf.x0 + h, leaf.y0, h, node),
-        build(leaf.x0, leaf.y0 + h, h, node),
-        build(leaf.x0 + h, leaf.y0 + h, h, node),
-      ].filter((n): n is Node => n !== null)
-      node.children = kids.length > 0 ? kids : null
-      balanceSplits++
-      if (!parent) continue
-      parent.children = parent.children!.map((c) => (c === leaf ? node : c))
+  /** 把叶子换成一个（可能为空的）中间节点；返回是否真的细分了。 */
+  const splitLeaf = (leaf: Node): boolean => {
+    if (leaf.s <= minCell) return false
+    const parent = leaf.parent
+    const h = leaf.s >> 1
+    const node: Node = {
+      x0: leaf.x0,
+      y0: leaf.y0,
+      s: leaf.s,
+      children: [],
+      parent,
     }
-    if (balanceSplits > 200000) break
+    const kids = [
+      build(leaf.x0, leaf.y0, h, node),
+      build(leaf.x0 + h, leaf.y0, h, node),
+      build(leaf.x0, leaf.y0 + h, h, node),
+      build(leaf.x0 + h, leaf.y0 + h, h, node),
+    ].filter((n): n is Node => n !== null)
+    node.children = kids.length > 0 ? kids : null
+    if (!parent) return false
+    parent.children = parent.children!.map((c) => (c === leaf ? node : c))
+    return true
   }
 
+  /** 按判据选一批叶子细分，直到不动或到次数上限；返回实际细分次数。 */
+  const relax = (
+    needsSplit: (leaf: Node) => boolean,
+    maxIter: number,
+  ): number => {
+    let splits = 0
+    for (let iter = 0; iter < maxIter; iter++) {
+      const leaves: Node[] = []
+      collectLeaves(root, leaves)
+      const victims = leaves.filter(needsSplit)
+      if (victims.length === 0) break
+      let moved = false
+      for (const leaf of victims) if (splitLeaf(leaf)) moved = true
+      if (!moved) break
+      splits++
+      if (splits > 200000) break
+    }
+    return splits
+  }
+
+  // ① 2:1 受限松弛：有「小 2 级以上的邻居」的叶子强制细分（消 T-junction）。
+  const balanceSplits = relax(hasThinNeighbor, 12)
+
   // ── 缝合状态：每条边是否需要中点（邻居更细一级）──
-  const leafNeedsMid = (
+  function leafNeedsMid(
     x0: number,
     y0: number,
     s: number,
     dir: "R" | "L" | "B" | "T",
-  ): boolean => {
-    const h = s >> 1
+  ): boolean {
+    const { x1, y1 } = cellRect(x0, y0, s)
+    const mx = (x0 + x1) >> 1
+    const my = (y0 + y1) >> 1
     let px: number
     let py: number
     if (dir === "R") {
-      px = x0 + s
-      py = y0 + h
+      px = x1
+      py = my
     } else if (dir === "L") {
       px = x0 - 1
-      py = y0 + h
+      py = my
     } else if (dir === "B") {
-      px = x0 + h
-      py = y0 + s
+      px = mx
+      py = y1
     } else {
-      px = x0 + h
+      px = mx
       py = y0 - 1
     }
     if (px < 0 || py < 0 || px >= width || py >= height) return false
     const n = findLeaf(root, px, py)
     return n !== null && n.s < s
   }
+
+  /**
+   * 该叶子**实际要输出**的像素多边形（含边中点、已按出面顺序），顶点全部落在支撑内时返回。
+   *
+   * 返回 `null` = 有顶点需要贴边界外推（snap）⇒ 它不属于「预测面」，不能用来验差。
+   * 顺序必须与出面段完全一致：`c00 →(L 中点) c01 →(B 中点) c11 →(R 中点) c10 →(T 中点)`。
+   */
+  const leafPolygon = (leaf: Node): Array<[number, number, number]> | null => {
+    const { x0, y0, s } = leaf
+    const { x1, y1 } = cellRect(x0, y0, s)
+    const mx = (x0 + x1) >> 1
+    const my = (y0 + y1) >> 1
+    const midX = x1 - x0 >= 2
+    const midY = y1 - y0 >= 2
+    const pts: Array<[number, number, number]> = []
+    const push = (px: number, py: number): boolean => {
+      if (!support[py * width + px] || !(depth[py * width + px] > 0)) {
+        return false
+      }
+      pts.push([px, py, disparity[py * width + px]])
+      return true
+    }
+    const need = (dir: "R" | "L" | "B" | "T"): boolean =>
+      leafNeedsMid(x0, y0, s, dir)
+    if (!push(x0, y0)) return null
+    if (midY && need("L") && !push(x0, my)) return null
+    if (!push(x0, y1)) return null
+    if (midX && need("B") && !push(mx, y1)) return null
+    if (!push(x1, y1)) return null
+    if (midY && need("R") && !push(x1, my)) return null
+    if (!push(x1, y0)) return null
+    if (midX && need("T") && !push(mx, y0)) return null
+    return pts
+  }
+
+  /** 输出面误差（`null` = 该叶子含贴边外推顶点，不参与验差）。 */
+  const leafEmittedError = (leaf: Node): number | null => {
+    const pts = leafPolygon(leaf)
+    if (!pts) return null
+    const { x0, y0, s } = leaf
+    const { x1, y1 } = cellRect(x0, y0, s)
+    return polygonFanError(pts, disparity, width, { x0, y0, x1, y1 }, support)
+  }
+
+  // ② **验差驱动细分**：只按「四角预测面」验差不等于最终三角划分合格 ——
+  //    缝合中点会改变扇形三角化，实测仍有少量叶子（s=8/16）输出面误差 0.0050–0.0070，
+  //    略超 0.005。这里按**实际输出多边形**再验一遍，超差且还没到 minCell 就继续细分。
+  relax((leaf) => {
+    if (leaf.s <= minCell) return false
+    const err = leafEmittedError(leaf)
+    return err !== null && err > maxError
+  }, 6)
 
   // ── 出面 ──
   const fx = width / (2 * Math.tan(camera.fovX / 2))
@@ -505,6 +649,23 @@ export function buildLayerReliefLod(
   const indices: number[] = []
   const leaves: Node[] = []
   collectLeaves(root, leaves)
+  // ── 验差报告：对**最终**叶子集逐叶统计（超差的非最小叶子已被上一段细分掉）──
+  let maxTriangleError = 0
+  let errorSkippedLeaves = 0
+  let minCellViolations = 0
+  let overErrorLeaves = 0
+  for (const leaf of leaves) {
+    const err = leafEmittedError(leaf)
+    if (err === null) {
+      errorSkippedLeaves++
+      continue
+    }
+    if (err > maxTriangleError) maxTriangleError = err
+    if (err > maxError) {
+      if (leaf.s <= minCell) minCellViolations++
+      else overErrorLeaves++
+    }
+  }
 
   const dist2 = (a: number, b: number): number => {
     const ax = pool.positions[a * 3]
@@ -518,21 +679,26 @@ export function buildLayerReliefLod(
 
   for (const leaf of leaves) {
     const { x0, y0, s } = leaf
-    const h = s >> 1
+    const { x1, y1 } = cellRect(x0, y0, s)
+    const mx = (x0 + x1) >> 1
+    const my = (y0 + y1) >> 1
+    // 中点只在边真的有长度时插入（末格被裁剪后可能只剩 1–2 列）。
+    const midX = x1 - x0 >= 2
+    const midY = y1 - y0 >= 2
     const c00 = pool.get(x0, y0)
-    const c01 = pool.get(x0, y0 + s)
-    const c11 = pool.get(x0 + s, y0 + s)
-    const c10 = pool.get(x0 + s, y0)
+    const c01 = pool.get(x0, y1)
+    const c11 = pool.get(x1, y1)
+    const c10 = pool.get(x1, y0)
     if (c00 < 0 || c01 < 0 || c11 < 0 || c10 < 0) continue
     // 多边形（图像坐标 y 向下；绕序与 relief.ts 的表面三角一致）：c00→c01→c11→c10。
     const poly: number[] = [c00]
-    if (leafNeedsMid(x0, y0, s, "L")) pushIfValid(poly, x0, y0 + h)
+    if (midY && leafNeedsMid(x0, y0, s, "L")) pushIfValid(poly, x0, my)
     poly.push(c01)
-    if (leafNeedsMid(x0, y0, s, "B")) pushIfValid(poly, x0 + h, y0 + s)
+    if (midX && leafNeedsMid(x0, y0, s, "B")) pushIfValid(poly, mx, y1)
     poly.push(c11)
-    if (leafNeedsMid(x0, y0, s, "R")) pushIfValid(poly, x0 + s, y0 + h)
+    if (midY && leafNeedsMid(x0, y0, s, "R")) pushIfValid(poly, x1, my)
     poly.push(c10)
-    if (leafNeedsMid(x0, y0, s, "T")) pushIfValid(poly, x0 + h, y0)
+    if (midX && leafNeedsMid(x0, y0, s, "T")) pushIfValid(poly, mx, y0)
     // 对角翻转：3D 对角线更短者优先（与 relief.ts 同语义）。
     // 无中点时：从 c00 扇出 = 对角线 c00-c11；从 c01 扇出 = 对角线 c01-c10。
     const flip = dist2(c10, c01) < dist2(c00, c11)
@@ -556,6 +722,11 @@ export function buildLayerReliefLod(
     levelHistogram[k] = (levelHistogram[k] ?? 0) + 1
   }
   const levelCount = levelHistogram.length
+  if (overErrorLeaves > 0) {
+    console.warn(
+      `[lod] ${overErrorLeaves} 个非最小叶子输出面误差 > maxError=${maxError}（验差未驱动细分，请查 build 的 regionClean）`,
+    )
+  }
   return {
     positions,
     uvs,
@@ -569,8 +740,113 @@ export function buildLayerReliefLod(
         (_, i) => levelHistogram[i] ?? 0,
       ),
       balanceSplits,
+      maxTriangleError,
+      errorSkippedLeaves,
+      minCellViolations,
+      overErrorLeaves,
     },
   }
+}
+
+/** 三次重心插值：`pts` 的三角形内返回插值，否则 `null`。 */
+function baryInterp(
+  ax: number,
+  ay: number,
+  av: number,
+  bx: number,
+  by: number,
+  bv: number,
+  cx: number,
+  cy: number,
+  cv: number,
+  px: number,
+  py: number,
+): number | null {
+  const d = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay)
+  if (Math.abs(d) < 1e-12) return null
+  const eps = 1e-6
+  const l1 = ((bx - px) * (cy - py) - (cx - px) * (by - py)) / d
+  const l2 = ((cx - px) * (ay - py) - (ax - px) * (cy - py)) / d
+  const l3 = 1 - l1 - l2
+  if (!(l1 >= -eps && l2 >= -eps && l3 >= -eps)) return null
+  return l1 * av + l2 * bv + l3 * cv
+}
+
+/**
+ * **输出曲面**（凸多边形扇形三角化）vs 视差场的最大误差。
+ *
+ * `pts` = 按出面顺序排列的多边形顶点 `[x, y, n]`（含中点、已按翻对角排好首顶点）。
+ * `bounds` = 该叶子的像素矩形；只在矩形内取样。
+ *
+ * 大 cell（边长 > 64px）按 `stride` 抽样：全像素验差的代价是 `Σ 面积 × 三角数`，
+ * 在 3024×2268 上按 6 个三角形全验会翻倍网格化耗时，而超差只会发生在面内中部、
+ * 不会只有单个像素。**权威判定用 `scripts/meshing-golden.ts` A11 的全像素实现。**
+ */
+function polygonFanError(
+  pts: readonly (readonly [number, number, number])[],
+  disparity: ArrayLike<number>,
+  width: number,
+  bounds: { x0: number; y0: number; x1: number; y1: number },
+  support?: Uint8Array,
+): number {
+  if (pts.length < 3) return 0
+  const span = Math.max(bounds.x1 - bounds.x0, bounds.y1 - bounds.y0)
+  const stride = span > 64 ? Math.ceil(span / 64) : 1
+  let worst = 0
+  for (let y = bounds.y0; y <= bounds.y1; y += stride) {
+    for (let x = bounds.x0; x <= bounds.x1; x += stride) {
+      const idx = y * width + x
+      // 只验**有支撑**的像素：无支撑像素的视差没有意义（0 或别的表面），
+      // 拿它当"真值"会把贴边 cell（snapBoundary）判成天文数字误差。
+      if (support && !support[idx]) continue
+      const actual = disparity[idx]
+      let interp: number | null = null
+      for (let i = 1; i + 1 < pts.length && interp === null; i++) {
+        const a = pts[0]
+        const b = pts[i]
+        const c = pts[i + 1]
+        interp = baryInterp(
+          a[0],
+          a[1],
+          a[2],
+          b[0],
+          b[1],
+          b[2],
+          c[0],
+          c[1],
+          c[2],
+          x,
+          y,
+        )
+      }
+      if (interp === null) continue
+      const err = Math.abs(interp - actual)
+      if (err > worst) worst = err
+    }
+  }
+  return worst
+}
+
+/**
+ * 四角矩形按两种对角之一的扇形三角化误差（`regionClean` 的选择门用）。
+ *
+ * `flip=false` ⇒ 从 `c00` 扇出（对角线 `c00–c11`）；`flip=true` ⇒ 从 `c01` 扇出
+ * （对角线 `c01–c10`）—— 与出面段的 `rotateFrom(poly, c01)` 完全同序。
+ */
+function fanError(
+  rect: { x0: number; y0: number; x1: number; y1: number },
+  corners: { n00: number; n10: number; n01: number; n11: number },
+  flip: boolean,
+  disparity: ArrayLike<number>,
+  width: number,
+  support: Uint8Array,
+): number {
+  const a: [number, number, number] = [rect.x0, rect.y0, corners.n00]
+  const b: [number, number, number] = [rect.x0, rect.y1, corners.n01]
+  const c: [number, number, number] = [rect.x1, rect.y1, corners.n11]
+  const d: [number, number, number] = [rect.x1, rect.y0, corners.n10]
+  const pts = flip ? [b, c, d, a] : [a, b, c, d]
+  return polygonFanError(pts, disparity, width, rect, support)
 }
 
 /** 循环左移，使 `start` 成为首元素（保持相对顺序 ⇒ 绕序不变）。 */

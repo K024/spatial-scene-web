@@ -18,10 +18,11 @@
  * 产物被 `.gitignore` 忽略（体积大、可重建），所以 web 端在缺样例时要能优雅降级。
  *
  * 用法：
- *   npx tsx scripts/pack/sample.ts                                   # 原始分辨率，L=6，LOD 自动
+ *   npx tsx scripts/pack/sample.ts                                   # 原始分辨率，L=8，LOD 自动
  *   npx tsx scripts/pack/sample.ts --layers 4 --no-draco
  *   npx tsx scripts/pack/sample.ts --method errorDriven               # 层放置方法（默认 quantile）
  *   npx tsx scripts/pack/sample.ts --no-refine                        # 关掉原图回写（对照）
+ *   npx tsx scripts/pack/sample.ts --min-coverage 0.99                # 残差回写的覆盖率门（默认 0.9）
  *   npx tsx scripts/pack/sample.ts --lod-min-cell 8                  # 手动指定最小格子
  *   npx tsx scripts/pack/sample.ts --width 768                       # 降采样（快速调试）
  *   npx tsx scripts/pack/sample.ts --no-lod                          # 逐像素出面（对照）
@@ -37,7 +38,11 @@
 import { mkdirSync, writeFileSync } from "node:fs"
 import { resolve } from "node:path"
 import { parseArgs } from "node:util"
-import type { LayerSamplingMethod } from "../../src/spatial-scene/layering/index.ts"
+import {
+  DEFAULT_WRITEBACK_MIN_COVERAGE,
+  type LayerSamplingMethod,
+  type RefineStats,
+} from "../../src/spatial-scene/layering/index.ts"
 import {
   DEFAULT_IMAGE,
   numFlag,
@@ -100,7 +105,8 @@ interface Args {
   /**
    * 层数（= mesh 数 = 出面 / 显存代价）。
    *
-   * @default 6
+   * @default 8（**与库默认一致**：`generate.ts:buildGlb` / `utils/meshing-scene.ts:renderLayerStack`
+   * 的 `layers` 缺省都是 8，这里再写别的值就会让"脚本产出"和"库默认"分叉）
    */
   layers: number
   /**
@@ -164,6 +170,13 @@ interface Args {
    */
   extrapRgba: boolean
   /**
+   * 残差回写的**覆盖率门** `A_total ≥ minCoverage`。
+   *
+   * @default DEFAULT_WRITEBACK_MIN_COVERAGE（0.9）= 库默认，见
+   * `layering/refine.ts:ResidualWritebackOptions.minCoverage` 的实测权衡表
+   */
+  minCoverage: number
+  /**
    * LOD 出面开关（`--no-lod` 关 = 逐像素出面）。
    *
    * @default true
@@ -217,6 +230,7 @@ const CLI_OPTIONS = {
   "own-gap": { type: "boolean", default: true },
   "max-dist": { type: "string" },
   "extrap-rgba": { type: "boolean", default: false },
+  "min-coverage": { type: "string" },
   lod: { type: "boolean", default: true },
   "lod-min-cell": { type: "string", default: "auto" },
   "lod-max-error": { type: "string", default: String(RECOMMENDED.maxError) },
@@ -244,7 +258,7 @@ function parseCli(argv: readonly string[]): Args {
 
   return {
     image: resolve(values.image ?? DEFAULT_IMAGE),
-    layers: numFlag("--layers", values.layers, 6),
+    layers: numFlag("--layers", values.layers, 8),
     method: method as LayerSamplingMethod,
     width: width === "native" ? "native" : numFlag("--width", width, 0),
     draco: values.draco,
@@ -257,6 +271,11 @@ function parseCli(argv: readonly string[]): Args {
     ownGap: values["own-gap"],
     maxDist: numFlag("--max-dist", values["max-dist"], 16),
     extrapRgba: values["extrap-rgba"],
+    minCoverage: numFlag(
+      "--min-coverage",
+      values["min-coverage"],
+      DEFAULT_WRITEBACK_MIN_COVERAGE,
+    ),
     lod: values.lod,
     lodMinCell:
       values["lod-min-cell"] === "auto"
@@ -363,9 +382,10 @@ function logStats(input: {
   result: BuildGlbResult
   args: Args
   lodMinCell: number
+  refineStats: RefineStats
   out: string
 }): void {
-  const { inferred, scene, result, args, lodMinCell, out } = input
+  const { inferred, scene, result, args, lodMinCell, refineStats, out } = input
   const { loaded, capabilities } = inferred
   const mesh = result.meshScene
   const { placement } = result.layered
@@ -397,6 +417,7 @@ function logStats(input: {
   console.log(
     `  分层    L=${args.layers}  method=${args.method}  refine=${args.refine ? "on" : "off"}  ` +
       `overlap=${args.overlap}  补齐=${args.complete ? `own-gap=${args.ownGap ? "on" : "off"} hidden<=${args.maxDist}px${args.extrapRgba ? "+rgba" : ""}` : "off"}  ` +
+      `回写门 A>=${args.minCoverage}  ` +
       `撕裂清理=${args.tearCleanup ? "on" : "off"}`,
   )
   console.log(
@@ -443,6 +464,36 @@ function logStats(input: {
         ? `背衬 tri=${backing.triangleCount.toLocaleString()} (tex ${backing.texture.width}×${backing.texture.height}, z=${backing.depthRange[0].toFixed(2)}m)`
         : "背衬=off"),
   )
+  // LOD 的**验差账**：`maxError` 只是细分目标，不是界 —— 输出面误差下限由 `minCell` 决定
+  // （2–16px 的格子里本来就没有"三条边拟合得出"的曲面）。native + `minCell=16` 实测
+  // 约 1k 个最小格/层超差、上万片叶子因贴边外推（snap）无法验差，这两个数必须能看见。
+  if (args.lod) {
+    let worstTriError = 0
+    let minCellViolations = 0
+    let skipped = 0
+    for (const r of mesh.report.layers) {
+      worstTriError = Math.max(worstTriError, r.maxTriangleError ?? 0)
+      minCellViolations += r.minCellViolations ?? 0
+      skipped += r.errorSkippedLeaves ?? 0
+    }
+    console.log(
+      `  验差    输出面误差max=${worstTriError.toFixed(5)}  最小格超差=${minCellViolations.toLocaleString()}` +
+        `  跳过验差(snap)=${skipped.toLocaleString()}` +
+        `（门 ${args.lodMaxError}；逐档明细见 meshing-lod.ts）`,
+    )
+  }
+  // 回写账：覆盖率门决定了「多少像素根本没回写」，限幅计数决定了尾部误差从哪来。
+  if (result.refined && refineStats.writebackCoveredPixels > 0) {
+    const covered = refineStats.writebackCoveredPixels
+    const px = mesh.layers[0].width * mesh.layers[0].height
+    console.log(
+      `  回写    A≥${args.minCoverage} 覆盖 ${((covered / px) * 100).toFixed(1)}%（${covered.toLocaleString()} px）` +
+        `  限幅 ${refineStats.writebackClampedPixels.toLocaleString()} px` +
+        `（${((refineStats.writebackClampedPixels / covered) * 100).toFixed(2)}%）` +
+        `  层色夹回[0,1] ${refineStats.writebackRangeClippedPixels.toLocaleString()} 通道` +
+        `  限幅残留均值 ${refineStats.writebackResidualMean.toFixed(4)}`,
+    )
+  }
   console.log(
     `  产物    ${out}  ${(result.glb.length / 1024 / 1024).toFixed(2)} MB  ` +
       `refined=${result.refined ? "yes" : "no"}`,
@@ -472,6 +523,13 @@ async function main(): Promise<void> {
       ? autoMinCell(scene.width, scene.height)
       : args.lodMinCell
 
+  // 回写诊断（覆盖率门 / 限幅计数）：`buildGlb` 会把它透传给 `refineLayers`。
+  const refineStats: RefineStats = {
+    writebackCoveredPixels: 0,
+    writebackClampedPixels: 0,
+    writebackRangeClippedPixels: 0,
+    writebackResidualMean: 0,
+  }
   const device = await createNodeDevice()
   try {
     const result = await buildGlb(device, scene, inferred.loaded.image, {
@@ -485,6 +543,8 @@ async function main(): Promise<void> {
             hidden: { maxDistancePx: args.maxDist, rgba: args.extrapRgba },
           }
         : false,
+      // 残差回写的覆盖率门：**要看得见**它做了什么（覆盖多少、限幅多少）。
+      writeback: { minCoverage: args.minCoverage, stats: refineStats },
       draco: args.draco,
       mesh: {
         tears: {
@@ -522,7 +582,15 @@ async function main(): Promise<void> {
       ],
       totalMs,
     )
-    logStats({ inferred, scene, result, args, lodMinCell, out: args.out })
+    logStats({
+      inferred,
+      scene,
+      result,
+      args,
+      lodMinCell,
+      refineStats,
+      out: args.out,
+    })
   } finally {
     device.destroy()
   }

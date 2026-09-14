@@ -16,6 +16,15 @@
  *   `baseColorTexture` = 该层 `rgb/alpha` 编码出的 sRGB PNG（直通 α，零预乘）。
  * - `extras.layerIndex`：glTF 没有 `renderOrder`，渲染端读它设 back-to-front 顺序。
  *
+ * ── ⚠ 跨查看器风险（交付契约的一部分，别只在自己 viewer 上看）──
+ * 全 `BLEND` + 靠 `extras.layerIndex` 排序 ⇒ **任何不读 `extras` 的查看器**（各种系统 3D 预览、
+ * 部分 DCC 导入器）都会拿到错的层序/深度写入。glTF 没有通用 `renderOrder`，这是格式本身的缺口。
+ * 所以：① 至少要在一个**非本仓库**的 GLB 消费端验收（透明顺序、mip、alpha、相机比例）；
+ * ② 纹理采样要显式 `CLAMP_TO_EDGE`；③ 透明像素做受 patch 约束的 **RGB 扩边（不抬 α）**；
+ * ④ 想更稳就试「不透明核心 + 透明边缘」两类 primitive（核心写深度），但**不能只看三角三个角的 α**
+ * （内部可能有洞、mip 也会改变覆盖），要保守检查纹理覆盖域；⑤ 先关 Draco 做质量基线，
+ * 再评估 14-bit 位置/UV 量化的边缘误差 —— 压缩不该遮住上游 bug。
+ *
  * ── 相机与元数据内置（无 sidecar）──
  * 相机四参数 -> glTF 原生 `cameras[0].perspective`（`yfov` 是**弧度**）；
  * 参考位姿 = 单位变换的相机 node（bake 后 glTF 相机看 −Z，与 three 一致）。

@@ -52,6 +52,21 @@ export interface WSplatFrame {
   readonly visible: Uint8Array
 }
 
+/**
+ * ⚠ 字段语义的两条硬边界（加新字段前先读这里）。
+ *
+ * 1. **`ED == A · D` 是层数据的不变量**：`depth` 是渲染期的 α 加权期望深度 `ED / A`
+ *    （见 `resolve` 的 `D = ED/A`）。任何后处理只要动了 `depth` 或 `alpha`，就必须同步
+ *    `accumulatedDepth`（`layering/refine.ts` 用唯一的 `writePixelState()` 兜住这件事，
+ *    并有 `layerMomentResidual()` 体检）。改了一处忘了另一处，下游 `compositeAlphaDepth`、
+ *    责任层判定与 mesh 的合成深度就会用**陈旧值** —— 这种错不会让画面立刻崩，只会让
+ *    「深度明明改了、合成还说旧值」。
+ * 2. **`alpha` 是渲染覆盖，不是「我有多确定」**：`A` 回答的是「这个像素被画了多少」，
+ *    与「这个像素的内容有多可信」是两件事（外推出来的像素可以有 `A=1`、置信度极低）。
+ *    将来要传"来源 / 置信"就**另开字段**（如 `provenance: observed | splat-derived |
+ *    extrapolated | inpainted | fallback` + 独立 confidence），别把语义塞进 `alpha`。
+ */
+
 /** resolve 阶段的旋钮。 */
 export interface WSplatResolveOptions {
   /**

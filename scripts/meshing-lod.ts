@@ -11,12 +11,23 @@
  * ── B 段（真实层帧，GPU）──
  * 走一遍 splat -> L 层 RGBAD，对每档参数用 CPU 光栅器在**参考视角**把 LOD 网格画回来，
  * 与该层 splat 帧比 NCC / MAE / α≥aLo 覆盖率，并给三角数。
+ * 表格里还有 `lod.ts` 的**验差账**：`验差max`（输出三角面 vs 视差场）、`最小格超差`
+ * （到了 minCell 也压不到 maxError 的叶子数 —— 这些是"误差有界"这句话的例外）、`跳过验差`
+ * （含贴边外推顶点的叶子，不参与预测面验差）。判定在 `meshing-golden.ts` 的 A10/A11。
+ *
+ * `--out <dir>` 另外出**几何覆盖图**（只用层网格，**不含背板**）：参考视角 + 侧移视角。
+ * 覆盖图是**末格丢失**这类缺陷唯一肉眼可判的产物 —— 参考视角出现成条黑带 = 那条带没有几何
+ * （修前的实现会在尺寸不整除时丢掉最右/最下一整条：native 3024×2268 + `minCell=16`
+ * ⇒ 右 15 列、下 11 行，约 3.4 万像素）。
  *
  * 用法：
  *   npx tsx scripts/meshing-lod.ts --synthetic
  *   npx tsx scripts/meshing-lod.ts --ply py-models/out/ply/example.ply --width 768 --layers 8
+ *   npx tsx scripts/meshing-lod.ts --width 768 --out temp/meshing-lod --shift 0.03
  */
 
+import { mkdirSync, writeFileSync } from "node:fs"
+import { resolve } from "node:path"
 import { parseArgs } from "node:util"
 import { ndcDepthFromZ } from "../src/spatial-scene/layering/disparity-stats.ts"
 import {
@@ -29,9 +40,15 @@ import {
 import {
   buildLayerReliefLod,
   type LodOptions,
+  type LodStats,
 } from "../src/spatial-scene/meshing/lod.ts"
+import type { TornEdges } from "../src/spatial-scene/meshing/tears.ts"
 import type { LayerMesh } from "../src/spatial-scene/meshing/types.ts"
-import { numFlag } from "./utils/common.ts"
+import type { WSplatCamera } from "../src/spatial-scene/wsplat/camera.ts"
+import type { WSplatFrame } from "../src/spatial-scene/wsplat/types.ts"
+import { numFlag, REPO_ROOT } from "./utils/common.ts"
+import { rgbaToPngBuffer } from "./utils/image.ts"
+import { createNovelCamera, imageShiftToAngleRad } from "./utils/layer-warp.ts"
 import { rasterizeLayerMesh } from "./utils/meshing-cpu.ts"
 import { renderLayerStack } from "./utils/meshing-scene.ts"
 import { withNodeDevice } from "./utils/webgpu.ts"
@@ -52,6 +69,10 @@ interface Args {
   width: number
   /** 层数。 */
   layers: number
+  /** 覆盖图输出目录（给 `undefined` = 不出图）。 */
+  out?: string
+  /** 侧移幅度（占幅宽比，纯旋转等价量）。 */
+  shift: number
 }
 
 /**
@@ -64,6 +85,8 @@ const CLI_OPTIONS = {
   ply: { type: "string", default: "py-models/out/ply/example.ply" },
   width: { type: "string" },
   layers: { type: "string" },
+  out: { type: "string" },
+  shift: { type: "string" },
 } as const
 
 function parseCli(argv: readonly string[]): Args {
@@ -79,6 +102,8 @@ function parseCli(argv: readonly string[]): Args {
     ply: values.ply,
     width: numFlag("--width", values.width, 768),
     layers: numFlag("--layers", values.layers, 8),
+    out: values.out,
+    shift: numFlag("--shift", values.shift, 0.03),
   }
 }
 
@@ -339,7 +364,7 @@ async function runReal(args: Args): Promise<void> {
         `near/far ${near.toFixed(3)}/${far.toFixed(3)}m ===`,
     )
     console.log(
-      " 配置              三角数    顶点数   NCC(覆盖内)  MAE      α≥aLo漏覆盖  漏α能量",
+      " 配置              三角数    顶点数   NCC(覆盖内)  MAE      α≥aLo漏覆盖  漏α能量   验差max  最小格超差  跳过验差",
     )
 
     /** 与 golden B 同口径的逐层度量：NCC 只在“帧可见 且 网格覆盖”的像素上算。 */
@@ -348,6 +373,8 @@ async function runReal(args: Args): Promise<void> {
       meshOf: (k: number) => {
         mesh: LayerMesh
         texture: { rgb: Float32Array; alpha: Float32Array }
+        /** LOD 的验差账（dense 基线没有）。 */
+        stats?: LodStats
       },
     ): void => {
       let totalTri = 0
@@ -356,9 +383,19 @@ async function runReal(args: Args): Promise<void> {
       let worstMae = 0
       let worstMissLo = 0
       let worstEnergy = 0
+      let worstTriError = 0
+      let minCellViolations = 0
+      let skipped = 0
+      let hasStats = false
       for (let k = 0; k < args.layers; k++) {
         const { frame } = pre[k]
-        const { mesh, texture } = meshOf(k)
+        const { mesh, texture, stats } = meshOf(k)
+        if (stats) {
+          hasStats = true
+          worstTriError = Math.max(worstTriError, stats.maxTriangleError)
+          minCellViolations += stats.minCellViolations
+          skipped += stats.errorSkippedLeaves
+        }
         totalTri += mesh.triangleCount
         totalVert += mesh.vertexCount
         const raster = rasterizeLayerMesh(
@@ -408,7 +445,10 @@ async function runReal(args: Args): Promise<void> {
       console.log(
         ` ${label.padEnd(18)} ${String(totalTri).padStart(8)}  ${String(totalVert).padStart(8)}  ` +
           `${worstNcc.toFixed(5)}      ${worstMae.toFixed(5)}  ` +
-          `${(worstMissLo * 100).toFixed(3)}%        ${(worstEnergy * 100).toFixed(3)}%`,
+          `${(worstMissLo * 100).toFixed(3)}%        ${(worstEnergy * 100).toFixed(3)}%   ` +
+          `${(hasStats ? worstTriError.toFixed(5) : "—").padStart(8)}  ` +
+          `${(hasStats ? String(minCellViolations) : "—").padStart(10)}  ` +
+          `${(hasStats ? String(skipped) : "—").padStart(8)}`,
       )
     }
 
@@ -448,13 +488,120 @@ async function runReal(args: Args): Promise<void> {
                   alpha: frame.alpha,
                 }),
                 texture: { rgb: frame.rgb, alpha: frame.alpha },
+                stats: lod.stats,
               }
             },
           )
         }
       }
     }
+
+    if (args.out) {
+      await writeCoverageMaps(args, scene.camera, pre)
+    }
   })
+}
+
+/**
+ * 出**几何覆盖图**：层网格（不含背板）在参考视角 / 侧移视角下的覆盖率。
+ *
+ * 为什么不含背板：背板铺满整幅，带上它就是 100% 全白、什么也看不出来。
+ * 要看的是"层几何有没有漏" —— 参考视角成条黑带 = 那条带没有几何（末格被整格丢掉的长相），
+ * 侧移视角的一侧黑区 = 外推题目的固有代价（宽度 ≈ shift 幅宽）。
+ */
+async function writeCoverageMaps(
+  args: Args,
+  camera: WSplatCamera,
+  pre: readonly {
+    frame: WSplatFrame
+    support: Uint8Array
+    disparity: Float32Array
+    torn: TornEdges
+  }[],
+): Promise<void> {
+  const outDir = resolve(REPO_ROOT, args.out!)
+  mkdirSync(outDir, { recursive: true })
+  const { width, height } = camera
+  const pixels = width * height
+  const yawDeg = (imageShiftToAngleRad(args.shift, camera.fovX) * 180) / Math.PI
+  const novel = createNovelCamera(camera, yawDeg, 0)
+  // 只看「支撑内的像素是否被几何盖住」，所以 α 阈值与支撑一致即可。
+  const configs: Array<{ minCell: number; maxError: number; snap: boolean }> = [
+    { minCell: 1, maxError: 0.02, snap: true },
+    { minCell: 4, maxError: 0.02, snap: true },
+    { minCell: 8, maxError: 0.02, snap: true },
+  ]
+  console.log(`\n── 几何覆盖图（层网格，不含背板）-> ${outDir}`)
+  for (const cfg of configs) {
+    const refCov = new Uint8Array(pixels)
+    const novelCov = new Uint8Array(pixels)
+    let supportPixels = 0
+    let refCoveredSupport = 0
+    for (let k = 0; k < args.layers; k++) {
+      const { frame, support, disparity, torn } = pre[k]
+      const lod = buildLayerReliefLod(
+        { width, height, depth: frame.depth },
+        camera,
+        support,
+        disparity,
+        torn,
+        {
+          minCellPx: cfg.minCell,
+          maxError: cfg.maxError,
+          maxCellPx: 128,
+          snapBoundary: cfg.snap,
+        },
+      )
+      const mesh = asLayerMesh(lod, width, height, {
+        rgb: frame.rgb,
+        alpha: frame.alpha,
+      })
+      const texture = { width, height, rgb: frame.rgb, alpha: frame.alpha }
+      const ref = rasterizeLayerMesh(mesh, texture, camera)
+      const nv = rasterizeLayerMesh(mesh, texture, novel)
+      for (let i = 0; i < pixels; i++) {
+        if (ref.covered[i]) refCov[i] = 1
+        if (nv.covered[i]) novelCov[i] = 1
+        if (k === 0 && support[i]) supportPixels++
+        if (k === 0 && support[i] && ref.covered[i]) refCoveredSupport++
+      }
+    }
+    const tag = `mc${cfg.minCell}_e${cfg.maxError}_snap${cfg.snap ? "y" : "n"}`
+    await writeMaskPng(
+      resolve(outDir, `coverage_ref_${tag}.png`),
+      refCov,
+      width,
+      height,
+    )
+    await writeMaskPng(
+      resolve(outDir, `coverage_shift_${tag}.png`),
+      novelCov,
+      width,
+      height,
+    )
+    console.log(
+      `  ${tag.padEnd(24)} 参考视角覆盖支撑 ${((refCoveredSupport / Math.max(1, supportPixels)) * 100).toFixed(2)}%` +
+        `（层 0 支撑 ${supportPixels}px）`,
+    )
+  }
+}
+
+/** 0/1 掩码 -> 黑白 PNG。 */
+async function writeMaskPng(
+  path: string,
+  mask: Uint8Array,
+  width: number,
+  height: number,
+): Promise<void> {
+  const rgba = new Uint8Array(mask.length * 4)
+  for (let i = 0; i < mask.length; i++) {
+    const v = mask[i] ? 255 : 0
+    rgba[i * 4] = v
+    rgba[i * 4 + 1] = v
+    rgba[i * 4 + 2] = v
+    rgba[i * 4 + 3] = 255
+  }
+  writeFileSync(path, await rgbaToPngBuffer(rgba, width, height))
 }
 
 async function main(): Promise<void> {

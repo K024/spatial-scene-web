@@ -57,16 +57,23 @@ export {
 export type {
   HiddenExtendOptions,
   LayerCompletionOptions,
+  MomentResidual,
   RefineLayersOptions,
+  RefineStats,
   RefineWeightOptions,
+  ResidualWritebackOptions,
 } from "./refine.ts"
 export {
+  applyResidualWriteback,
   blendImageWriteback,
   completeLayerGeometry,
   compositeAlphaDepth,
   computeLayerOwnership,
   computeOcclusionMasks,
   computeRefineWeight,
+  DEFAULT_WRITEBACK_MAX_DELTA,
+  DEFAULT_WRITEBACK_MIN_COVERAGE,
+  layerMomentResidual,
   layerPixelToImagePixel,
   refineLayers,
   resampleImageToLinear,

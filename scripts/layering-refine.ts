@@ -7,8 +7,26 @@
  * （`alpha` / `depth` 的局部梯度 / 层号 + 遮挡）。本工具只做：
  *   1. 渲 L 层 RGBAD（现成通路）；
  *   2. 把原图重采样到层分辨率、线性化；
- *   3. 算每层权重图 `w`（`computeRefineWeight`）并回写颜色（`blendImageWriteback`）；
+ *   3. 算每层权重图 `w`（`computeRefineWeight`）并回写颜色；
  *   4. 比「回写前 / 回写后」的参考视角颜色 vs **原图**（NCC / MAE）+ 出图。
+ *
+ * ── 回写算法对照（v2 新增，A/B/C）──
+ * 同一套权重、只换回写公式，打一张三行表 + |Δ| 分位数：
+ * ```
+ *   无回写      层色不动（基线）
+ *   旧式        c ← (1−w)·c_splat + w·c_image   —— 在两层以上共同贡献的像素上会把已对的合成写坏
+ *   残差        Δc_k = q_k·v_k/Σ(q v²)·r        —— 合成被推向原图；r=0 时逐位不动
+ * ```
+ * 分位数只统计 `A ≥ 0.999`（合成覆盖满）的像素 —— 覆盖不满的地方回写本来就**不该**动
+ * （覆盖率门 `minCoverage`），把那些像素算进来会冤枉残差式。判定在 `layering-golden.ts` 的 A0c。
+ *
+ * 判读时注意**两条轴**：残差式在它作用的像素上近乎精确（P99 ≈ 0.0008），但覆盖率门把
+ * ~10% 的像素排除在外；旧式不看覆盖、把原图色涂满全图，聚合 NCC/MAE 反而更好。
+ * 用 `--min-coverage` 扫（0.999/0.99/0.9/0.5）能看到放宽后残差式在两条轴上都占优，
+ * 代价是"未观测背景被烘进层色" —— 那条只能在侧视里验。
+ *
+ * 表里还打一行**深度矩体检** `ED == A·D`（`layerMomentResidual`）：逐层 `depth` 是渲染期
+ * 期望深度 `ED/A`，谁改了 depth/α 谁就得同步 ED。
  *
  * ── 关键约束 ──
  * - 回写**只改颜色**，不改几何 ⇒ 不破坏验收 A；但参考视角颜色会变，所以 E2 分两栏。
@@ -33,8 +51,11 @@ import {
 import { computeDisparityStats } from "../src/spatial-scene/layering/disparity-stats.ts"
 import { computeLayerPlacement } from "../src/spatial-scene/layering/placement.ts"
 import {
+  applyResidualWriteback,
   blendImageWriteback,
   computeRefineWeight,
+  DEFAULT_WRITEBACK_MIN_COVERAGE,
+  layerMomentResidual,
   resampleImageToLinear,
 } from "../src/spatial-scene/layering/refine.ts"
 import type { LayerSamplingMethod } from "../src/spatial-scene/layering/types.ts"
@@ -66,6 +87,15 @@ const CLI = {
   "scope-scan": { type: "boolean" },
   /** 平滑因子尺度（相对深度）。调大 = 更多像素通过平滑门。 */
   "smooth-scale": { type: "string" },
+  /**
+   * 残差回写的**覆盖率门** `A_total ≥ minCoverage`（缺省 = 库默认
+   * `DEFAULT_WRITEBACK_MIN_COVERAGE` = 0.9）。
+   *
+   * 调低 = 更多像素参与回写（参考视角更像原图），代价是把**没被任何层表达**的背景
+   * 烘进层色（`1−A` 只能靠层色去补），且分摊式会按 `1/A²` 放大残差。
+   * 扫一遍 {0.5, 0.9, 0.99, 0.999} 看权衡（取值理由见 `refine.ts` 的实测表）。
+   */
+  "min-coverage": { type: "string" },
 } as const
 
 interface Layer {
@@ -186,6 +216,56 @@ function weightRgba(weight: Float32Array): Uint8Array {
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v
 }
+
+/**
+ * 合成 vs 原图的 |Δ| 分位数（线性直通域，三通道一起统计）。
+ *
+ * **只统计 `A ≥ minCoverage` 的像素**：覆盖不满的地方回写本来就不该动
+ * （`applyResidualWriteback` 的覆盖率门），算进来会把「背景没被表达」记成「回写错了」。
+ */
+function deviationStats(
+  comp: { rgb: Float32Array; alpha: Float32Array },
+  imageLinear: Float32Array,
+  pixels: number,
+  minCoverage = 0.999,
+): {
+  covered: number
+  p50: number
+  p90: number
+  p99: number
+  p999: number
+  over05: number
+  max: number
+} {
+  const diffs: number[] = []
+  let max = 0
+  for (let i = 0; i < pixels; i++) {
+    if (!(comp.alpha[i] >= minCoverage)) continue
+    for (let c = 0; c < 3; c++) {
+      const d = Math.abs(comp.rgb[i * 3 + c] - imageLinear[i * 3 + c])
+      diffs.push(d)
+      if (d > max) max = d
+    }
+  }
+  diffs.sort((a, b) => a - b)
+  const q = (p: number): number =>
+    diffs.length === 0
+      ? 0
+      : diffs[Math.min(diffs.length - 1, Math.floor(p * diffs.length))]
+  return {
+    covered: diffs.length / 3,
+    p50: q(0.5),
+    p90: q(0.9),
+    p99: q(0.99),
+    p999: q(0.999),
+    over05:
+      diffs.length === 0
+        ? 0
+        : diffs.filter((d) => d > 0.05).length / diffs.length,
+    max,
+  }
+}
+
 function linearToSrgb(x: number): number {
   const c = clamp01(x)
   return c <= 0.0031308 ? c * 12.92 : 1.055 * c ** (1 / 2.4) - 0.055
@@ -249,6 +329,9 @@ async function main(): Promise<void> {
   const fgCap = args.values["fg-layers"]
   const scopeScan = args.values["scope-scan"] === true
   const smoothScale = Number(args.values["smooth-scale"] ?? 0.02)
+  const minCoverage = Number(
+    args.values["min-coverage"] ?? DEFAULT_WRITEBACK_MIN_COVERAGE,
+  )
   const ls = (args.values.layers ?? "8")
     .split(",")
     .map((s) => Number(s.trim()))
@@ -333,10 +416,71 @@ async function main(): Promise<void> {
       const before = compositeStraight(layers, pixels)
       const mBefore = colorMetrics(before, imageLinear, pixels)
 
-      console.log(`\n  L=${L}  method=${method}  smooth-scale=${smoothScale}`)
+      console.log(
+        `\n  L=${L}  method=${method}  smooth-scale=${smoothScale}  残差覆盖率门 A≥${minCoverage}`,
+      )
       console.log(
         `    回写前 vs 原图：亮度 NCC ${mBefore.ncc.toFixed(4)}  sRGB MAE ${mBefore.mae.toFixed(4)}（覆盖 ${mBefore.covered}px）`,
       )
+      {
+        const moment = layerMomentResidual(frames)
+        console.log(
+          `    深度矩体检 ED==A·D：最大相对残差 ${(moment.maxRel * 100).toFixed(3)}%` +
+            ` · 违规 ${moment.violations}px · 最差层 ${moment.worstLayer}` +
+            `（几何补齐之后必须仍为 0）`,
+        )
+      }
+
+      // ── 回写算法对照：无回写 / 旧式逐层混色 / 合成残差（同一套权重）──
+      const capFull = fgCap !== undefined ? Number(fgCap) : L
+      const weightsFull = frames.map((f, k) =>
+        computeRefineWeight(f, {
+          foreground: k < capFull,
+          smoothnessScale: smoothScale,
+          occluded: occluded[k],
+        }),
+      )
+      const algorithmRows: Array<{
+        name: string
+        comp: { rgb: Float32Array; alpha: Float32Array }
+      }> = [
+        { name: "无回写", comp: before },
+        {
+          name: "旧式(逐层混色)",
+          comp: compositeStraight(
+            frames.map((f, k) => ({
+              rgb: blendImageWriteback(f.rgb, imageLinear, weightsFull[k]),
+              alpha: f.alpha,
+            })),
+            pixels,
+          ),
+        },
+        {
+          name: "残差(默认)",
+          comp: compositeStraight(
+            applyResidualWriteback(frames, imageLinear, weightsFull, {
+              minCoverage,
+            }).map((f) => ({ rgb: f.rgb, alpha: f.alpha })),
+            pixels,
+          ),
+        },
+      ]
+      console.log(
+        "    算法（fg<" +
+          capFull +
+          "）      亮度NCC   sRGB MAE    |Δ|P50    P90     P99     P999    >0.05   max",
+      )
+      for (const row of algorithmRows) {
+        const m = colorMetrics(row.comp, imageLinear, pixels)
+        // 分位数统一按 A ≥ 0.999 统计（跨门比较；门本身在上一行显示）
+        const d = deviationStats(row.comp, imageLinear, pixels, 0.999)
+        console.log(
+          `    ${row.name.padEnd(18)} ${m.ncc.toFixed(4)}    ${m.mae.toFixed(4)}   ` +
+            `${d.p50.toFixed(4)}  ${d.p90.toFixed(4)}  ${d.p99.toFixed(4)}  ${d.p999.toFixed(4)}  ` +
+            `${(d.over05 * 100).toFixed(2)}%   ${d.max.toFixed(4)}` +
+            `（三行同一口径：A≥0.999 占 ${((d.covered / pixels) * 100).toFixed(1)}%）`,
+        )
+      }
 
       const caps = scopeScan
         ? [...new Set([0, 1, 2, 4, L])].sort((a, b) => a - b)
@@ -351,10 +495,12 @@ async function main(): Promise<void> {
             occluded: occluded[k],
           }),
         )
-        const refined = frames.map((f, k) => ({
-          rgb: blendImageWriteback(f.rgb, imageLinear, weights[k]),
-          alpha: f.alpha,
-        }))
+        // 走**残差回写**（管线默认）；旧式只在上面的算法对照表里出现。
+        const refined = applyResidualWriteback(
+          frames,
+          imageLinear,
+          weights,
+        ).map((f) => ({ rgb: f.rgb, alpha: f.alpha }))
         const after = compositeStraight(refined, pixels)
         const m = colorMetrics(after, imageLinear, pixels)
         console.log(
@@ -375,11 +521,17 @@ async function main(): Promise<void> {
           occluded: occluded[k],
         }),
       )
-      const refinedOut = frames.map((f, k) => ({
+      const refinedOut = applyResidualWriteback(
+        frames,
+        imageLinear,
+        weightForOut,
+      ).map((f) => ({ rgb: f.rgb, alpha: f.alpha }))
+      const legacyOut = frames.map((f, k) => ({
         rgb: blendImageWriteback(f.rgb, imageLinear, weightForOut[k]),
         alpha: f.alpha,
       }))
       const afterOut = compositeStraight(refinedOut, pixels)
+      const afterLegacy = compositeStraight(legacyOut, pixels)
       const imageSrgb = toSrgbRgba(
         imageLinear,
         new Float32Array(pixels).fill(1),
@@ -389,8 +541,12 @@ async function main(): Promise<void> {
         { label: "原图", rgba: imageSrgb },
         { label: "回写前", rgba: toSrgbRgba(before.rgb, before.alpha, pixels) },
         {
-          label: `回写后 fg<${writeCap}`,
+          label: `残差回写 fg<${writeCap}`,
           rgba: toSrgbRgba(afterOut.rgb, afterOut.alpha, pixels),
+        },
+        {
+          label: "旧式回写（对照）",
+          rgba: toSrgbRgba(afterLegacy.rgb, afterLegacy.alpha, pixels),
         },
       ]
       await writeMontage(

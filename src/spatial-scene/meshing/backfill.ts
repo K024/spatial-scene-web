@@ -17,9 +17,27 @@
  * 这里实现为：**back-to-front 合成所有层 → 预乘 → 盒降采样 → 解预乘**。
  * 按 α 预乘再平均等价于「α 加权平均」，且不会让低 α 像素的颜色污染结果。
  *
+ * ⚠ **证据等级（别把接口当算法）**：头文件只能证明「存在 back layer / 它同时收 color + depth /
+ * 有 α 加权降采样」这些**字段与管线状态**；具体补洞核、张量布局、是否与公开 SHARP 同模型
+ * **都没有证明**。本模块是按字段语义**自研**的实现，措辞上只能说"受接口启发"，
+ * 不能写成"还原了苹果算法"。
+ *
  * ── 为什么是平面，不是「第 L+1 层」──
  * 它不参与分层合成（不写 `layers`），只在最后画；深度取最远层边界。语义对齐 Apple
  * `generateBackingPlaneMesh:atDepth:` —— 一块铺满视锥的 quad（`layerIndex = -1`）。
+ *
+ * ── ⚠ 已知限制：它**不是干净背景**（别把它当兜底真值）──
+ * 1. 贴的是**全层合成图**（含主体）⇒ 主体被印到远处，侧移/大角度时会露出「第二个主体」；
+ * 2. 合成 α 未强制补满 ⇒ 它**不保证堵洞**（只是"有东西可画"），重复半透明内容还会抬高最终 α；
+ * 3. 正确做法是分四种洞分别处理（采样小孔 / 前景背后的遮挡区 / 原图外框露底 / 透明边串色），
+ *    背衬只承担最后一种"低频兜底"，并且每帧该统计它的**暴露率**。
+ *
+ * ── 待验证的低成本支路：反序（near→far）绘制当背景候选 ──
+ * 对同一组 splat 按 near→far 顺序正常 over 绘制 ⇒ 后画的远片元盖在近片元上 = **远表面优先**，
+ * 深度用同一套反序可见权重累计（`D_bg = ED_bg / A_bg`）。它**不产生新覆盖**（`A` 仍是
+ * `1 − Π(1−α_i)`）、也**不是真值**：远处低 α 噪点会被放大，透明物体可能给出不合理背景。
+ * 采信前必须过门：`A_bg` 达最低覆盖、`D_bg` 明显位于可见前表面之后、深度方差不过大且与
+ * 邻域 patch 连续、来源在目标侧视中确实可能被暴露。**尚未实现**。
  *
  * @see SOLIDI 无对应实现（它用 inpainting 网络补洞）；本模块按 Apple `MXIBackLayer` +
  *   backing plane 的**算法级**路线自研。
@@ -211,7 +229,6 @@ export function buildBackingPlane(
   camera: WSplatCamera,
   farDepth: number,
   disparityRange: readonly [number, number],
-  depthRange: readonly [number, number],
   options: BackfillOptions = {},
 ): LayerMesh | null {
   if (options.enabled === false) return null
@@ -227,7 +244,11 @@ export function buildBackingPlane(
     camera,
     depth,
     disparityRange,
-    depthRange,
+    // ⚠ 背衬是**一个平面**，它自己的深度范围就是 `[depth, depth]`。
+    // 旧实现把调用方的 `[near, far]`（**全场**范围）原样传下去，于是产物里背衬的
+    // `depthRange` 报的是全场范围 —— `sample.ts` 打印出 `z=0.46m`（= near），
+    // 看起来像「背板落在近平面」，还让背衬的元数据与它自己的几何不符。
+    [depth, depth],
     texture,
   )
 }

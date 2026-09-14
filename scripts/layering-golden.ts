@@ -37,7 +37,7 @@
  * ── 这些门**不**覆盖什么 ──
  * 1. 视角外推误差（gapRate / bleedRate / colorMAE）—— 见 E3。
  * 2. 哪个档位更好 —— 这里只验「实现是否正确」，不验「选择是否最优」。
- * 3. 密度补偿 / 原图回写（§2.5 / §2.6）—— 尚未实现。
+ * 3. 密度补偿 —— 尚未实现（原图回写已实现，门在 A0b/A0c）。
  *
  * 用法：
  *   npx tsx scripts/layering-golden.ts                # 全跑（含 GPU 的 E2），最慢
@@ -76,18 +76,26 @@ import {
   quantizationError,
 } from "../src/spatial-scene/layering/placement.ts"
 import {
+  applyResidualWriteback,
   blendImageWriteback,
   completeLayerGeometry,
   compositeAlphaDepth,
   computeLayerOwnership,
   computeOcclusionMasks,
   computeRefineWeight,
+  DEFAULT_WRITEBACK_MIN_COVERAGE,
+  layerMomentResidual,
   layerPixelToImagePixel,
+  refineLayers,
+  resampleImageToLinear,
 } from "../src/spatial-scene/layering/refine.ts"
 import type {
   DisparityStats,
+  LayeredRGBD,
+  LayerPlacement,
   LayerSamplingMethod,
 } from "../src/spatial-scene/layering/types.ts"
+import type { SourceImage } from "../src/spatial-scene/sharp/preprocess.ts"
 import {
   viewDepthToNdcDepth,
   type WSplatCamera,
@@ -572,6 +580,263 @@ function completionChecks(): void {
   }
 }
 
+// ────────────────────────────── A0c 回归反例（纯 CPU） ──────────────────────────────
+
+/**
+ * 三条**曾经的漏网性质**（旧门全都放过）。它们不是「实现 bug」，而是契约没写到的地方，
+ * 所以留在独立段落、名字直接对应缺陷：
+ *
+ * 1. **`ED == A·D`**：`depth` 是渲染期 α 加权期望深度 `ED/A`，谁改了 `depth`/`α` 谁就得同步
+ *    `accumulatedDepth`。旧实现里 hidden 的 **depth-only** 分支只写 depth ⇒ α=0.2 的像素
+ *    D 从 1.2 变 2.5、ED 停在 0.24（应 0.5），合成深度报 1.2（应 2.5）。
+ * 2. **零 α 小洞归属**：合成 α=0 的采样洞旧实现无人认领（`owner = −1`）⇒ 永远补不上；
+ *    而真结构间隙（背后**看得见**更远表面）**不许**填死 —— 本条门正反两面都钉。
+ * 3. **残差回写的合成恒等**：回写后逐层 over 合成必须 == 原图，且 `r = 0` 的像素逐位不动。
+ *    旧式「逐层混原图色」在近层 α=0.6 + 远层 α=1 的例子上把合成打偏 **0.0483**（反向对照）。
+ */
+function reviewCounterChecks(): void {
+  const w = 8
+  const h = 8
+  const px = w * h
+  const imageLinear = new Float32Array(px * 3).fill(0.9)
+  const placement = {
+    near: 1,
+    far: 3,
+    boundariesZ: new Float32Array([1, 2, 3]),
+  }
+
+  // ① ED == A·D：hidden 的 depth-only 分支曾只写 depth、不动 accumulatedDepth。
+  //    构造：近层不透明盖住中心 2×2；远层在那里是「弱 α + 陈旧深度」（α=0.2, D=1.2），
+  //    右侧一列是它的真支撑（α=0.8, z=2.5）⇒ 补齐会把中心那 4 个像素的 D 改写成 2.5，
+  //    ED 必须同步成 0.2×2.5=0.5（旧实现停在 0.24，合成深度因此报 1.2）。
+  {
+    const near = makeFrame(w, h)
+    const far = makeFrame(w, h)
+    const block: Array<[number, number]> = [
+      [3, 3],
+      [4, 3],
+      [3, 4],
+      [4, 4],
+    ]
+    for (const [x, y] of block) {
+      setSurface(near, y * w + x, 1.5, 1, [0.9, 0.1, 0.1])
+    }
+    for (let y = 0; y < h; y++) {
+      setSurface(far, y * w + 5, 2.5, 0.8, [0.1, 0.1, 0.9])
+    }
+    for (const [x, y] of block) {
+      setSurface(far, y * w + x, 1.2, 0.2, [0.1, 0.1, 0.9])
+    }
+    const out = completeLayerGeometry(
+      [near, far],
+      placement,
+      imageLinear,
+      w,
+      h,
+      {
+        ownGap: false,
+        hidden: { maxDistancePx: 4, smoothPasses: 0 },
+      },
+    )
+    const residual = layerMomentResidual(out)
+    const center = 3 * w + 3
+    const composite = compositeAlphaDepth(out, px)
+    momentOk.record(
+      residual.violations === 0 && residual.maxRel <= 2e-3,
+      "hidden 补齐后 ED == A·D",
+      `最大相对残差 ${(residual.maxRel * 100).toFixed(2)}% · 违规 ${residual.violations} px` +
+        ` · 合成 D[远层可见处]=${composite.depth[3 * w + 5].toFixed(3)}（期望 2.5）`,
+    )
+    momentOk.record(
+      Math.abs(out[1].accumulatedDepth[center] - 0.5) < 1e-3,
+      "中心像素 ED 同步",
+      `ED=${out[1].accumulatedDepth[center].toFixed(3)}（旧实现 0.240，应为 0.500）`,
+    )
+  }
+
+  // ② 零 α 小洞：单层、中心 α=0 且被同表面支撑围住 ⇒ 必须被本层认领补齐；
+  //    同一构造下若**背后有可观测的远表面**，那是真间隙（栏杆），不许填死。
+  {
+    const hole = 3 * w + 3
+    const solo = makeFrame(w, h)
+    for (let i = 0; i < px; i++) setSurface(solo, i, 1.5, 1)
+    setSurface(solo, hole, 0, 0)
+    const filled = completeLayerGeometry([solo], placement, imageLinear, w, h, {
+      hidden: false,
+    })
+    const filledOk =
+      filled[0].alpha[hole] > 0.5 &&
+      Math.abs(filled[0].depth[hole] - 1.5) < 1e-5
+
+    const rail = makeFrame(w, h)
+    const behind = makeFrame(w, h)
+    for (let i = 0; i < px; i++) setSurface(rail, i, 1.5, 1)
+    setSurface(rail, hole, 0, 0)
+    setSurface(behind, hole, 2.5, 1)
+    const kept = completeLayerGeometry(
+      [rail, behind],
+      placement,
+      imageLinear,
+      w,
+      h,
+      {
+        hidden: false,
+      },
+    )
+    const keptOk = kept[0].alpha[hole] === 0
+
+    zeroHoleOk.record(
+      filledOk && keptOk,
+      "零 α 小洞归属",
+      `采样洞${filledOk ? "已补" : "未补"}（α=${filled[0].alpha[hole].toFixed(2)} D=${filled[0].depth[hole].toFixed(2)}）` +
+        ` · 栏杆间隙${keptOk ? "保留" : "被填死"}`,
+    )
+  }
+
+  // ③ 回写合成恒等：层栈已经等于原图时必须逐位不动；旧式「逐层混原图色」会把它写坏。
+  {
+    const near = makeFrame(w, h)
+    const far = makeFrame(w, h)
+    for (let i = 0; i < px; i++) {
+      setSurface(near, i, 1.4, 0.6, [1, 0, 0])
+      setSurface(far, i, 2.5, 1, [0, 0, 1])
+    }
+    const src = new Uint8Array(px * 3)
+    for (let i = 0; i < px; i++) {
+      src[i * 3] = linearToSrgb8(0.6)
+      src[i * 3 + 1] = 0
+      src[i * 3 + 2] = linearToSrgb8(0.4)
+    }
+    const image: SourceImage = { data: src, width: w, height: h, channels: 3 }
+    const expected = resampleImageToLinear(image, w, h)
+    const before = compositeRgb([near, far], px)
+
+    // 3a) 纯公式：权重全 1 时 `Σ v_k·Δc_k = r` ⇒ 合成落到原图。
+    const weights = [new Float32Array(px).fill(1), new Float32Array(px).fill(1)]
+    const residual = applyResidualWriteback([near, far], expected, weights)
+    const afterResidual = compositeRgb(residual, px)
+
+    // 3b) 走管线（refineLayers）：它内部的顺序是「先补齐 → 后回写」，
+    //     覆盖率门看的是**最终** α（见 refineLayers 的注释），所以这条同时钉住顺序。
+    const layered = asLayered([near, far], placement, w, h)
+    const viaPipeline = refineLayers(layered, image, {
+      complete: { hidden: false },
+    })
+    const afterPipeline = compositeRgb(viaPipeline.frames, px)
+
+    // 3c) 反向对照：同一套权重、只换回写算法 —— 旧式逐层混色必须**过不了**同一条门。
+    //     （注意权重不能拿全 1 凑：`w=1` 会把每层整片换成原图色，反而恰好合成正确。）
+    const legacy = refineLayers(layered, image, {
+      complete: { hidden: false },
+      residual: false,
+    })
+    const afterLegacy = compositeRgb(legacy.frames, px)
+
+    const dev = (a: Float32Array): number => {
+      let worst = 0
+      for (let i = 0; i < a.length; i++) {
+        worst = Math.max(worst, Math.abs(a[i] - expected[i]))
+      }
+      return worst
+    }
+    const devBefore = dev(before)
+    const devResidual = dev(afterResidual)
+    const devPipeline = dev(afterPipeline)
+    const devLegacy = dev(afterLegacy)
+    residualIdentityOk.record(
+      devResidual <= 1e-4 && devPipeline <= 2e-3,
+      "残差回写：合成 == 原图",
+      `残差式 ${devResidual.toFixed(5)} · 走管线 ${devPipeline.toFixed(5)}` +
+        `（回写前 ${devBefore.toFixed(5)}；旧式 ${devLegacy.toFixed(4)} 必须显著更差）`,
+    )
+    residualIdentityOk.record(
+      devLegacy > 0.01,
+      "反向对照：旧式混色确实会写坏",
+      `旧式偏差 ${devLegacy.toFixed(4)} > 0.01`,
+    )
+
+    // 3d) 覆盖率门有牙：`A < minCoverage` 的像素**逐位不动**（否则就是在烘未观测背景）。
+    //     构造：把远层在左半边的 α 降到 0.5 ⇒ 那半边 A = 0.6 + 0.4×0.5 = 0.8 < 0.9。
+    const lowA = makeFrame(w, h)
+    const lowB = makeFrame(w, h)
+    for (let i = 0; i < px; i++) {
+      const x = i % w
+      setSurface(lowA, i, 1.4, 0.6, [1, 0, 0])
+      setSurface(lowB, i, 2.5, x < w / 2 ? 0.5 : 1, [0, 0, 1])
+    }
+    const lowWeights = [
+      new Float32Array(px).fill(1),
+      new Float32Array(px).fill(1),
+    ]
+    const lowOut = applyResidualWriteback([lowA, lowB], expected, lowWeights)
+    let maxUnchangedBelow = 0
+    for (let i = 0; i < px; i++) {
+      const x = i % w
+      if (x >= w / 2) continue
+      for (let c = 0; c < 3; c++) {
+        maxUnchangedBelow = Math.max(
+          maxUnchangedBelow,
+          Math.abs(lowOut[0]!.rgb[i * 3 + c] - lowA.rgb[i * 3 + c]),
+          Math.abs(lowOut[1]!.rgb[i * 3 + c] - lowB.rgb[i * 3 + c]),
+        )
+      }
+    }
+    residualIdentityOk.record(
+      maxUnchangedBelow === 0,
+      "覆盖率门：A < minCoverage 逐位不动",
+      `A=0.8 区最大变化 ${maxUnchangedBelow}（默认门 ${DEFAULT_WRITEBACK_MIN_COVERAGE}）`,
+    )
+  }
+}
+
+/** `refineLayers` 只读 `frames / width / height / placement`，其余字段不参与计算。 */
+function asLayered(
+  frames: readonly WSplatFrame[],
+  placement: Pick<LayerPlacement, "near" | "far" | "boundariesZ">,
+  width: number,
+  height: number,
+): LayeredRGBD {
+  return {
+    L: frames.length,
+    width,
+    height,
+    near: placement.near,
+    far: placement.far,
+    placement: placement as LayerPlacement,
+    ranges: new Float32Array(frames.length * 2),
+    frames,
+    stats: undefined as never,
+  }
+}
+
+/** 直通线性 RGB 的逐层 over 合成（远→近），与 viewer 的 BLEND 同语义。 */
+function compositeRgb(
+  frames: readonly WSplatFrame[],
+  pixels: number,
+): Float32Array {
+  const acc = new Float32Array(pixels * 3)
+  for (let k = frames.length - 1; k >= 0; k--) {
+    const f = frames[k]
+    for (let i = 0; i < pixels; i++) {
+      const a = f.alpha[i]
+      if (!(a > 0)) continue
+      const inv = 1 - a
+      const o = i * 3
+      acc[o] = f.rgb[o] * a + acc[o] * inv
+      acc[o + 1] = f.rgb[o + 1] * a + acc[o + 1] * inv
+      acc[o + 2] = f.rgb[o + 2] * a + acc[o + 2] * inv
+    }
+  }
+  return acc
+}
+
+/** 线性 RGB -> sRGB8（造「原图」用；与 `refine.ts` 的 `srgbToLinear` 互逆）。 */
+function linearToSrgb8(v: number): number {
+  const c = v <= 0 ? 0 : v >= 1 ? 1 : v
+  const s = c <= 0.0031308 ? c * 12.92 : 1.055 * c ** (1 / 2.4) - 0.055
+  return Math.round(s * 255)
+}
+
 // ────────────────────────────── 合成分布 ──────────────────────────────
 
 interface Distribution {
@@ -970,6 +1235,9 @@ const ownGapOk = new Invariant("几何补齐：own-gap 回填")
 const hiddenOk = new Invariant("几何补齐：hidden 有界外推")
 const hiddenGeoOk = new Invariant("几何补齐：hidden depth-only")
 const ownerOk = new Invariant("几何补齐：α 归属")
+const momentOk = new Invariant("回归反例：ED == A·D（补齐后）")
+const zeroHoleOk = new Invariant("回归反例：零 α 小洞归属")
+const residualIdentityOk = new Invariant("回归反例：残差回写的合成恒等")
 
 /**
  * 前密指纹：`frontWeighted` 的最激进、`quantile` 是等质量基线、`hybrid` 在两者之间。
@@ -1603,6 +1871,7 @@ async function main(): Promise<void> {
   console.log("\n[A0b] 原图回写 + 几何补齐（refine.ts，纯 CPU）")
   refineChecks()
   completionChecks()
+  reviewCounterChecks()
 
   console.log("\n[A1] 统计量正确性（uniform-n 合成分布，200k 样本）")
   const reference = makeSynthetic(DISTRIBUTIONS[0], 200_000, 0x5eed)
@@ -1647,6 +1916,9 @@ async function main(): Promise<void> {
   hiddenOk.report()
   hiddenGeoOk.report()
   ownerOk.report()
+  momentOk.report()
+  zeroHoleOk.report()
+  residualIdentityOk.report()
 
   if (!noReal) {
     realDataChecks(plyPath)

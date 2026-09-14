@@ -3,13 +3,28 @@
  *
  * 阶段：**layered RGBAD -> mesh 场景**（`src/spatial-scene/meshing/`）。
  * 这是本模块的**唯一判定入口**：阈值写死在这里，退出码非 0 即「不过门」。
- * 曲线 / 出图由后续 `meshing-render-views.ts` 负责，它**不判定**。
+ * 曲线 / 出图由 `meshing-lod.ts`（LOD 档位扫 + 几何覆盖图）负责，它**不判定**。
  *
  * ⚠ 验收口径：
  * - **A3 是硬要求**：深度断层必须被正确撕裂 —— 断言「不存在横跨断层的三角形」，
  *   并且带**反向对照**（把撕裂关掉时确实会出现横跨三角形），否则这条门没有牙。
+ * - **A10/A11 是两条回归反例**：LOD 的**末格覆盖**（尺寸不是 `minCell` 整数倍时不许整格丢：
+ *   8×8 满支撑 + `minCell=4` 曾只出 1 个叶子 / 2 个三角，未覆盖 39/64）与**验差模型**
+ *   （必须按**实际输出的三角面**验，不能按四角双线性验：64×64 鞍面 + `maxError=0.005`
+ *   曾被放行到真实误差 0.02580）。
+ * - A5/A6 里的「四角拟合误差 / 对角翻转」只保证**候选格**的前提，不等于输出曲面合格。
  * - 其余是**简化项的回归门**（支撑迟滞 / 小岛 / despeckle / 几何合法 / 绕序 / 确定性）。
  * - B 类（同像素多深度的穿插）**不在这里设门**：它属于 layering，meshing 无法恢复。
+ *
+ * ── 几何误差预算（把门换算成像素，设计门槛时用）──
+ * 近似平行相机、横向平移 `t`（米）时，网格深度 `z_mesh` 与参考深度 `z_ref` 的偏差
+ * 在新视角上体现为屏幕位移：
+ * ```
+ *   ε_px ≈ f_px · |t| · |1/z_mesh − 1/z_ref|
+ *   |Δn|max ≈ ε_px · near · far / (f_px · |t| · (far − near))      （n = 视差域）
+ * ```
+ * 所以**视差域误差与分辨率无关**，这也是 `lod.ts` 用 `maxError` 在 n 域验差的原因。
+ * 第一轮几何实验以 **0.5–1px** 为目标，不当普适保证；轮廓与采样覆盖另设门（别只看平均误差）。
  *
  * 分两段：
  * - **A 段（纯 CPU，默认跑）**：合成输入上把支撑 / 撕裂 / 几何 / 绕序 / 确定性钉死。
@@ -20,6 +35,7 @@
  * 用法：
  *   npx tsx scripts/meshing-golden.ts                          # A + B（example.ply @256）
  *   npx tsx scripts/meshing-golden.ts --no-gpu                 # 只跑 A 段
+ *   node scripts/meshing-golden.ts --no-gpu                    # 沙箱里用 node（tsx 需要 unix socket）
  *   npx tsx scripts/meshing-golden.ts --ply py-models/out/ply/pier.ply --layers 4 --width 192
  */
 
@@ -27,6 +43,7 @@ import { parseArgs } from "node:util"
 import {
   computeDisparityStats,
   ndcDepthFromZ,
+  zFromNdcDepth,
 } from "../src/spatial-scene/layering/disparity-stats.ts"
 import { computeLayerPlacement } from "../src/spatial-scene/layering/placement.ts"
 import type {
@@ -34,9 +51,11 @@ import type {
   LayerSamplingMethod,
 } from "../src/spatial-scene/layering/types.ts"
 import type { BackfillFrame } from "../src/spatial-scene/meshing/backfill.ts"
+import type { TornEdges } from "../src/spatial-scene/meshing/index.ts"
 import {
   buildBackingPlaneMesh,
   buildLayerRelief,
+  buildLayerReliefLod,
   buildMeshScene,
   compositeLayersBackToFront,
   downscaleAlphaWeighted,
@@ -909,6 +928,218 @@ function compositeMeshAtCamera(
   return { rgb, alpha }
 }
 
+// ────────────────────────────── A10/A11 LOD 出面（回归反例）──────────────────────────────
+
+/**
+ * LOD 出面（`lod.ts`）的两条**回归反例门**。
+ *
+ * A5/A6 看的是"每层四角拟合误差 ≤ maxError"与"对角翻转取短的那条"，这两条**都放过了**
+ * 下面两个缺陷：
+ *
+ * - **A10 末格覆盖**：`regionClean` / `minCellClean` 曾要求 `x0+s ≤ width−1`，于是尺寸不是
+ *   `minCell` 整数倍的图上，最右/最下一整条带**没有任何几何**（native 3024×2268 配
+ *   `minCell=16` ⇒ 右 15 列、下 11 行是空的）。门：满支撑图上每个像素中心都必须落在
+ *   某个三角形内。
+ * - **A11 验差 = 输出曲面**：旧实现验的是四角**双线性**，而输出是**两三角分片线性**。
+ *   双线性鞍面 `n = 0.5 + a·u·v` 的双线性拟合误差恒为 0，输出三角面误差却是 `a/4`
+ *   —— 于是它能放行任意大的格子（实测 64×64、`a=0.1` 时真实误差 0.0258 > 门 0.005）。
+ *   门：对**实际输出三角形**逐像素验差 ≤ maxError。
+ */
+function lodGateChecks(): void {
+  /** 满支撑 + 常数视差的合成帧（纯几何，与纹理无关）。 */
+  const constantField = (width: number, height: number, n: number) => {
+    const depth = new Float32Array(width * height).fill(
+      zFromNdcDepth(n, NEAR, FAR),
+    )
+    return {
+      depth,
+      disparity: new Float32Array(width * height).fill(n),
+      support: new Uint8Array(width * height).fill(1),
+    }
+  }
+
+  const emptyTears = (width: number, height: number): TornEdges => ({
+    horizontal: new Uint8Array(height * Math.max(0, width - 1)),
+    vertical: new Uint8Array(Math.max(0, height - 1) * width),
+    tearEps: 0,
+    tornCount: 0,
+    despeckledCount: 0,
+    patchReconnected: 0,
+  })
+
+  /** `buildLayerReliefLod` 的产物只需这两个字段（它不返回 `LayerMesh`）。 */
+  type LodMeshLike = {
+    readonly uvs: Float32Array
+    readonly indices: Uint32Array
+  }
+
+  // 顶点像素坐标由 UV 反解（UV = (x+0.5)/w）⇒ 与像素中心同一坐标系。
+  const vertexPixels = (
+    mesh: LodMeshLike,
+    width: number,
+    height: number,
+  ): { vx: Float64Array; vy: Float64Array } => {
+    const verts = mesh.uvs.length / 2
+    const vx = new Float64Array(verts)
+    const vy = new Float64Array(verts)
+    for (let v = 0; v < verts; v++) {
+      vx[v] = mesh.uvs[v * 2] * width - 0.5
+      vy[v] = mesh.uvs[v * 2 + 1] * height - 0.5
+    }
+    return { vx, vy }
+  }
+
+  /** 逐像素中心是否被某个三角形盖住（带亚像素容差，同 `meshing-cpu.ts`）。 */
+  const uncovered = (
+    mesh: LodMeshLike,
+    width: number,
+    height: number,
+  ): number[] => {
+    const { vx, vy } = vertexPixels(mesh, width, height)
+    const covered = new Uint8Array(width * height)
+    const tol = 1e-3
+    const triangleCount = mesh.indices.length / 3
+    for (let t = 0; t < triangleCount; t++) {
+      const ia = mesh.indices[t * 3]
+      const ib = mesh.indices[t * 3 + 1]
+      const ic = mesh.indices[t * 3 + 2]
+      const ax = vx[ia]
+      const ay = vy[ia]
+      const bx = vx[ib]
+      const by = vy[ib]
+      const cx = vx[ic]
+      const cy = vy[ic]
+      const area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+      if (Math.abs(area) < 1e-12) continue
+      const minX = Math.max(0, Math.floor(Math.min(ax, bx, cx)))
+      const maxX = Math.min(width - 1, Math.ceil(Math.max(ax, bx, cx)))
+      const minY = Math.max(0, Math.floor(Math.min(ay, by, cy)))
+      const maxY = Math.min(height - 1, Math.ceil(Math.max(ay, by, cy)))
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          if (covered[y * width + x]) continue
+          const w0 = (cx - bx) * (y - by) - (cy - by) * (x - bx)
+          const w1 = (ax - cx) * (y - cy) - (ay - cy) * (x - cx)
+          const w2 = (bx - ax) * (y - ay) - (by - ay) * (x - ax)
+          const allPos = w0 >= -tol && w1 >= -tol && w2 >= -tol
+          const allNeg = w0 <= tol && w1 <= tol && w2 <= tol
+          if (allPos || allNeg) covered[y * width + x] = 1
+        }
+      }
+    }
+    const miss: number[] = []
+    for (let i = 0; i < covered.length; i++) if (!covered[i]) miss.push(i)
+    return miss
+  }
+
+  /** 输出三角面 vs 视差场的最大误差（全像素，不做抽样）。 */
+  const maxTriangleError = (
+    mesh: LodMeshLike,
+    disparity: ArrayLike<number>,
+    width: number,
+    height: number,
+  ): number => {
+    const { vx, vy } = vertexPixels(mesh, width, height)
+    const verts = mesh.uvs.length / 2
+    const vn = new Float64Array(verts)
+    for (let v = 0; v < verts; v++) {
+      vn[v] = disparity[vy[v] * width + vx[v]]
+    }
+    let worst = 0
+    const triangleCount = mesh.indices.length / 3
+    for (let t = 0; t < triangleCount; t++) {
+      const ia = mesh.indices[t * 3]
+      const ib = mesh.indices[t * 3 + 1]
+      const ic = mesh.indices[t * 3 + 2]
+      const ax = vx[ia]
+      const ay = vy[ia]
+      const bx = vx[ib]
+      const by = vy[ib]
+      const cx = vx[ic]
+      const cy = vy[ic]
+      const d = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay)
+      if (Math.abs(d) < 1e-12) continue
+      const minX = Math.max(0, Math.floor(Math.min(ax, bx, cx)))
+      const maxX = Math.min(width - 1, Math.ceil(Math.max(ax, bx, cx)))
+      const minY = Math.max(0, Math.floor(Math.min(ay, by, cy)))
+      const maxY = Math.min(height - 1, Math.ceil(Math.max(ay, by, cy)))
+      const eps = 1e-6
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          const l1 = ((bx - x) * (cy - y) - (cx - x) * (by - y)) / d
+          const l2 = ((cx - x) * (ay - y) - (ax - x) * (cy - y)) / d
+          const l3 = 1 - l1 - l2
+          if (!(l1 >= -eps && l2 >= -eps && l3 >= -eps)) continue
+          const interp = l1 * vn[ia] + l2 * vn[ib] + l3 * vn[ic]
+          const err = Math.abs(interp - disparity[y * width + x])
+          if (err > worst) worst = err
+        }
+      }
+    }
+    return worst
+  }
+
+  const sizes: Array<[number, number, string]> = [
+    [8, 8, "8×8（2 的幂）"],
+    [13, 7, "13×7（非 2 的幂）"],
+    [37, 5, "37×5（窄条）"],
+  ]
+  for (const [w, h, label] of sizes) {
+    const { depth, disparity, support } = constantField(w, h, 0.5)
+    const mesh = buildLayerReliefLod(
+      { width: w, height: h, depth },
+      makeCamera(w, h, w),
+      support,
+      disparity,
+      emptyTears(w, h),
+      { minCellPx: 4, maxError: 0.005, snapBoundary: true },
+    )
+    const miss = uncovered(mesh, w, h)
+    addCheck(
+      `A10 LOD 末格覆盖 ${label}`,
+      miss.length === 0,
+      miss.length === 0
+        ? `未覆盖 0/${w * h} px，tri=${mesh.indices.length / 3}`
+        : `未覆盖 ${miss.length}/${w * h} px（最大 x=${Math.max(...miss.map((i) => i % w))}）` +
+            `—— 旧实现 8×8 未覆盖 39/64、13×7 未覆盖 26/91`,
+    )
+  }
+
+  {
+    const w = 64
+    const h = 64
+    const amp = 0.1
+    const depth = new Float32Array(w * h)
+    const disparity = new Float32Array(w * h)
+    const support = new Uint8Array(w * h).fill(1)
+    for (let y = 0; y < h; y++) {
+      const v = (2 * y) / (h - 1) - 1
+      for (let x = 0; x < w; x++) {
+        const u = (2 * x) / (w - 1) - 1
+        const n = 0.5 + amp * u * v
+        disparity[y * w + x] = n
+        depth[y * w + x] = zFromNdcDepth(n, NEAR, FAR)
+      }
+    }
+    const maxError = 0.005
+    const mesh = buildLayerReliefLod(
+      { width: w, height: h, depth },
+      makeCamera(w, h, w),
+      support,
+      disparity,
+      emptyTears(w, h),
+      { minCellPx: 4, maxError, snapBoundary: true },
+    )
+    const err = maxTriangleError(mesh, disparity, w, h)
+    addCheck(
+      "A11 LOD 验差 = 输出三角面（鞍面）",
+      err <= maxError,
+      `输出面最大视差误差 ${err.toFixed(5)} ≤ ${maxError}` +
+        `（旧实现验双线性 ⇒ 放行到 0.02580）· leaves=${mesh.stats.leaves}`,
+    )
+  }
+}
+
 // ────────────────────────────── B 段：真实数据光栅化闭环 ──────────────────────────────
 
 /**
@@ -1306,6 +1537,9 @@ async function main(): Promise<void> {
 
   console.log("\n[A9] 回填 / 背衬平面（M3）")
   backfillChecks()
+
+  console.log("\n[A10/A11] LOD 出面：末格覆盖 / 验差 = 输出曲面")
+  lodGateChecks()
 
   if (noGpu) {
     console.log("\n[B] 真实数据光栅化闭环 —— 已用 --no-gpu 跳过")
