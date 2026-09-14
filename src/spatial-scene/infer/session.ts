@@ -37,8 +37,8 @@ export type ExecutionProviderHint =
   | "auto" // 平台上按推荐顺序自动选择（见 platform 实现）
   | "dml" // DirectML（node/Windows，本项目本地测试首选）
   | "cuda" // CUDA（node）
-  | "coreml" // CoreML（node/macOS）
-  | "webgpu" // WebGPU（web 首选；node 侧为实验性）
+  | "coreml" // CoreML（node/macOS；本链路 fp16 模型默认不接管，见 platform.node.ts）
+  | "webgpu" // WebGPU（web 与 macOS node 首选）
   | "wasm" // WASM（web 兜底）
   | "cpu" // 纯 CPU（保底，通常极慢）
 

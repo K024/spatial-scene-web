@@ -60,7 +60,7 @@ export type StageProgress = (
 export interface InferSceneOptions {
   /** 输入图路径（已落盘的任意格式，sharp 可读）。 */
   imagePath: string
-  /** 执行提供者偏好（默认 `auto`：Windows -> dml）。 */
+  /** 执行提供者偏好（默认 `auto`：Windows -> dml，macOS -> webgpu）。 */
   ep?: ExecutionProviderHint
   /** 模型路径；缺省 fp16。 */
   modelPath?: string

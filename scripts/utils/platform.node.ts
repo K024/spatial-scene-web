@@ -51,12 +51,25 @@ export function disableFloat16Array(): void {
  *
  * 规则：
  *   - 显式 hint 优先（除 "auto"）；
- *   - "auto" 时按平台推荐：Windows -> dml, macOS -> coreml, Linux -> cuda,
+ *   - "auto" 时按平台推荐：Windows -> dml, macOS -> webgpu, Linux -> cuda,
  *     再退到 cpu；
  *   - 环境变量 `SHARP_EP` 覆盖一切（值为 EP 名或逗号分隔的候选序列）。
  *
  * 之所以给出**候选序列**而非单一 EP：ort 支持 EP 回退链，
  * 让不受支持的算子落回 CPU 而不是整体失败。
+ *
+ * ── 为什么 macOS 不用 CoreML（实测）──
+ * 本链路的模型是 **fp16**（`sharp_fp16.onnx`），而 CoreML EP 默认
+ * `ModelFormat=NeuralNetwork` 时**只接受 fp32**（`base_op_builder.cc::
+ * IsInputDtypeSupport`：fp16/int64 仅在 MLProgram 路径下支持）⇒ 整张图
+ * 一个节点都不被接管，`EP=coreml` 只是注册成功、实际全在 CPU 上跑。
+ * 换 `ModelFormat=MLProgram` 能接管 2647/2655 个节点，但首次编译要几十分钟
+ * （还得配 `ModelCacheDirectory`）。fp32 基座同理不可用：建会话即吃掉
+ * 17 GB RSS、峰值占用 65 GB+，前向直接把机器打到内存上限被杀。
+ * 同一台机器上 `webgpu` 是 2756/2756 全接管、前向约 24s（CPU 对照约 108s），
+ * 所以 macOS 默认走 webgpu。注意 webgpu 只配 **fp16** 模型：
+ * `sharp_mm4f16_*.onnx` 的 `MatMulNBits` 在 node 的 WebGPU EP 上没有 kernel
+ * （382 个节点回退 CPU，占 84.8% kernel 时间），只会更慢。
  */
 export function resolveProviders(
   platform: NodeJS.Platform,
@@ -78,7 +91,8 @@ export function resolveProviders(
       // DirectML 在 Windows 上是 onnxruntime-node 的推荐 GPU EP
       return ["dml", "cpu"]
     case "darwin":
-      return ["coreml", "cpu"]
+      // webgpu 优先（理由见函数注释）；webgpu 不可用时由 ort 回退到 cpu
+      return ["webgpu", "cpu"]
     case "linux":
       return ["cuda", "cpu"]
     default:

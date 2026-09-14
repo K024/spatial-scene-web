@@ -22,7 +22,13 @@ export const ONNX_DIR = resolve(REPO_ROOT, "py-models", "out", "onnx")
 /** 默认 fp16 模型（高精度，本地测试目标）。 */
 export const MODEL_FP16 = resolve(ONNX_DIR, "sharp_fp16.onnx")
 
-/** 4bit 量化模型（WebGPU 目标，后续用）。 */
+/**
+ * 4bit 量化模型。
+ *
+ * ⚠ 只适用于**浏览器**侧 onnxruntime-web 的 WebGPU EP：`MatMulNBits` 在 node
+ * 的 WebGPU EP 上没有 kernel，会整批回退 CPU（实测慢 3~4 倍），
+ * 所以 node / macOS 走的是 {@link MODEL_FP16}。
+ */
 export const MODEL_MM4F16 = resolve(ONNX_DIR, "sharp_mm4f16_hqq_bs32.onnx")
 
 /** 默认测试图（ml-sharp 仓库自带的单张示例）。 */
