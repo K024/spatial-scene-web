@@ -47,6 +47,7 @@ async function main(): Promise<void> {
     args: process.argv.slice(2),
     options: CLI_OPTIONS,
     allowPositionals: false,
+    allowNegative: true,
     strict: true,
   })
   const width = Number.parseInt(args.values.width ?? "256", 10)

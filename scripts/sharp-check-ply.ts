@@ -12,6 +12,7 @@
 
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
+import { parseArgs } from "node:util"
 
 import { REPO_ROOT } from "./utils/common.ts"
 
@@ -68,9 +69,16 @@ function parseHeader(buf: Buffer): {
 }
 
 function main(): void {
+  // 只吃一个位置参数；`strict` 让拼错的 `--flag` 立刻报错而不是被当成路径。
+  const { positionals } = parseArgs({
+    args: process.argv.slice(2),
+    options: {},
+    allowPositionals: true,
+    strict: true,
+  })
   const path = resolve(
     REPO_ROOT,
-    process.argv[2] ?? "py-models/out/ply/example.ply",
+    positionals[0] ?? "py-models/out/ply/example.ply",
   )
   const buf = readFileSync(path)
   const { headerEnd, count, props, elements } = parseHeader(buf)

@@ -8,7 +8,7 @@
   5. 内部 monodepth 分支的 I/O 规格
   6. 导出 JS 侧数值对拍所需的 fixtures（out/fixtures/）
 
-第 6 步产出的 fixtures 供 `npm run sharp:compare`（scripts/compare-fixtures.ts）使用，
+第 6 步产出的 fixtures 供 `npx tsx scripts/sharp-compare-fixtures.ts` 使用，
 是"JS 实现是否忠实复刻 PyTorch"的唯一判据来源。原先这一步在独立的
 05_export_fixtures.py 里，现合并到本脚本，理由：
   * 两者共用同一套加载/构造逻辑（本就需要模型与输入），分文件反而重复；

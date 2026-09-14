@@ -28,6 +28,8 @@
 
 import type { Material, Mesh, Object3D } from "three"
 import { Box3, Vector3 } from "three"
+import dracoWasmUrl from "three/examples/jsm/libs/draco/gltf/draco_decoder.wasm?url"
+import dracoWrapperUrl from "three/examples/jsm/libs/draco/gltf/draco_wasm_wrapper.js?url"
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js"
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js"
 import type {
@@ -39,10 +41,21 @@ import type {
 } from "./types.ts"
 
 /**
- * Draco decoder 的**本地**路径（`public/draco/`，由 `npm run sync:assets` 从
- * `three/examples/jsm/libs/draco/gltf/` 拷来）。不走 Google CDN：离线可用、版本锁死。
+ * Draco decoder：**由打包器管资产**，不落 `public/`、不需要拷贝脚本。
+ *
+ * 用了 Vite 的 `?url`（dev 走 vite 的 module server，build 落到
+ * `assets/draco_decoder-<hash>.wasm` / `draco_wasm_wrapper-<hash>.js`），
+ * 于是既不走 Google CDN（离线可用），也不会出现「`public/` 里的副本与 `three`
+ * 版本漂移」——两个文件都直接来自 `three/examples/jsm/libs/draco/gltf/`。
+ *
+ * 取 `gltf/` 那一对而不是通用版：它 strip 掉了 attribute id，体积更小，正是
+ * glTF 路径该用的（通用版见 `libs/draco/`）。
+ *
+ * ⚠ 传 object 后 `dep_js`（纯 JS 兜底解码器）为 `null`：无 WebAssembly 的浏览器
+ * 会在 `preload()` 时抛 "WebAssembly is required when using a custom decoder paths."
+ * 现代浏览器都有 wasm，这个兜底不需要。
  */
-export const DRACO_DECODER_PATH = "/draco/"
+const DRACO_DECODER_PATHS = { js: dracoWrapperUrl, wasm: dracoWasmUrl }
 
 /** 内置样例（`npx tsx scripts/pack/sample.ts` 生成；不存在时安静跳过）。 */
 export const SAMPLE_URL = "/models/sample.glb"
@@ -52,9 +65,7 @@ let loader: GLTFLoader | null = null
 /** 单例 loader（DRACOLoader 每次 new 都会重建 worker，必须复用）。 */
 function getLoader(): GLTFLoader {
   if (loader) return loader
-  const draco = new DRACOLoader()
-    .setDecoderPath(DRACO_DECODER_PATH)
-    .setDecoderConfig({ type: "wasm" })
+  const draco = new DRACOLoader().setDecoderPath(DRACO_DECODER_PATHS)
   loader = new GLTFLoader().setDRACOLoader(draco)
   return loader
 }

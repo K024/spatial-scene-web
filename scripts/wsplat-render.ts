@@ -65,12 +65,19 @@ const CLI_OPTIONS = {
   camera: { type: "string" },
   width: { type: "string" },
   out: { type: "string" },
-  "no-sort": { type: "boolean" },
-  "no-cpu": { type: "boolean" },
+  /** 排序（`--no-sort` 关，用于对照「排序不是摆设」）。 */
+  sort: { type: "boolean", default: true },
+  /** CPU 参考帧（`--no-cpu` 关）。 */
+  cpu: { type: "boolean", default: true },
   "compare-aa": { type: "boolean" },
   "max-splats": { type: "string" },
   eps2d: { type: "string" },
   image: { type: "string" },
+  /**
+   * 与原图对比（`--no-image` 关）。
+   *
+   * ⚠ 这里是**负名**：正名 `image` 已被上面的「原图路径」占用，改正名就得改 flag。
+   */
   "no-image": { type: "boolean" },
 } as const
 
@@ -79,11 +86,12 @@ async function main(): Promise<void> {
     args: process.argv.slice(2),
     options: CLI_OPTIONS,
     allowPositionals: false,
+    allowNegative: true,
     strict: true,
   })
 
-  const shouldSort = !args.values["no-sort"]
-  const runCpu = !args.values["no-cpu"]
+  const shouldSort = args.values.sort
+  const runCpu = args.values.cpu
   const compareAa = args.values["compare-aa"] === true
   const maxSplats = args.values["max-splats"]
     ? Number.parseInt(args.values["max-splats"], 10)

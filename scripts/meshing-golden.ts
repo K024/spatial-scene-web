@@ -23,6 +23,7 @@
  *   npx tsx scripts/meshing-golden.ts --ply py-models/out/ply/pier.ply --layers 4 --width 192
  */
 
+import { parseArgs } from "node:util"
 import {
   computeDisparityStats,
   ndcDepthFromZ,
@@ -56,6 +57,7 @@ import type {
 import { createWSplatCamera } from "../src/spatial-scene/wsplat/camera.ts"
 import { createWSplatRenderer } from "../src/spatial-scene/wsplat/index.ts"
 import type { WSplatFrame } from "../src/spatial-scene/wsplat/types.ts"
+import { numFlag } from "./utils/common.ts"
 import { rasterizeLayerMesh } from "./utils/meshing-cpu.ts"
 import { renderLayerStack } from "./utils/meshing-scene.ts"
 import { withNodeDevice } from "./utils/webgpu.ts"
@@ -1255,16 +1257,24 @@ async function rasterizationChecks(options: {
 // ────────────────────────────── main ──────────────────────────────
 
 async function main(): Promise<void> {
-  const argv = process.argv.slice(2)
-  const argValue = (name: string): string | undefined => {
-    const i = argv.indexOf(name)
-    return i >= 0 ? argv[i + 1] : undefined
-  }
-  const noGpu = argv.includes("--no-gpu")
-  const width = Number(argValue("--width") ?? 256)
-  const layers = Number(argValue("--layers") ?? 8)
-  const method = (argValue("--method") ?? "quantile") as LayerSamplingMethod
-  const plyPath = argValue("--ply")
+  const { values } = parseArgs({
+    args: process.argv.slice(2),
+    options: {
+      gpu: { type: "boolean", default: true },
+      width: { type: "string" },
+      layers: { type: "string" },
+      method: { type: "string", default: "quantile" },
+      ply: { type: "string" },
+    },
+    allowPositionals: false,
+    allowNegative: true,
+    strict: true,
+  })
+  const noGpu = !values.gpu
+  const width = numFlag("--width", values.width, 256)
+  const layers = numFlag("--layers", values.layers, 8)
+  const method = values.method as LayerSamplingMethod
+  const plyPath = values.ply
 
   console.log("=".repeat(88))
   console.log("meshing golden 门（layered RGBAD -> mesh）")

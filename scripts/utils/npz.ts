@@ -4,6 +4,11 @@
  * NPZ = ZIP（本仓库由 numpy.savez 产生，条目为 **stored** 未压缩）。
  * 每个条目是 .npy v1.0 格式：magic + header dict + 原始数据。
  *
+ * ⚠ ZIP64：numpy 的 `savez` 用 `force_zip64=True` 打开条目，所以**即使文件很小**，
+ * local header 里的 `compressed_size` / `uncompressed_size` 也写成 `0xFFFFFFFF`，
+ * 真实 8 字节值放在 extra field `id=0x0001` 里。这里必须解 ZIP64，否则会把
+ * 「读到文件尾」当成解压结果（表现为长度不符）。
+ *
  * 支持 dtype：<f4 / <f8 / <i4 / <u4 / <i8 / |u1 / <u2。
  * 不支持：Fortran order（本仓库不用）、结构化 dtype。
  *
@@ -107,6 +112,53 @@ function parseNpy(buf: Buffer): NpyArray {
   return { data, shape, dtype: descr }
 }
 
+/**
+ * 解出条目的真实 `compressed_size` / `uncompressed_size`。
+ *
+ * local header 里这两个字段是 32 位；值为 `0xFFFFFFFF` 时表示「真值在 ZIP64
+ * extra field（id=0x0001）里」，且 extra field 内**只含被置位的那些字段**，
+ * 顺序固定为 original size（未压缩）→ compressed size。
+ */
+function resolveSizes(input: {
+  buf: Buffer
+  extraStart: number
+  extraLen: number
+  compSizeRaw: number
+  uncompSizeRaw: number
+  name: string
+}): { compSize: number; uncompSize: number } {
+  const { buf, extraStart, extraLen, compSizeRaw, uncompSizeRaw, name } = input
+  let compSize = compSizeRaw
+  let uncompSize = uncompSizeRaw
+  if (compSizeRaw !== 0xffffffff && uncompSizeRaw !== 0xffffffff) {
+    return { compSize, uncompSize }
+  }
+
+  const extraEnd = extraStart + extraLen
+  for (let e = extraStart; e + 4 <= extraEnd; ) {
+    const id = buf.readUInt16LE(e)
+    const size = buf.readUInt16LE(e + 2)
+    let p = e + 4
+    if (id === 0x0001) {
+      const fieldEnd = Math.min(p + size, extraEnd)
+      if (uncompSizeRaw === 0xffffffff && p + 8 <= fieldEnd) {
+        uncompSize = Number(buf.readBigUInt64LE(p))
+        p += 8
+      }
+      if (compSizeRaw === 0xffffffff && p + 8 <= fieldEnd) {
+        compSize = Number(buf.readBigUInt64LE(p))
+      }
+      break
+    }
+    e += 4 + size
+  }
+
+  if (compSize === 0xffffffff || uncompSize === 0xffffffff) {
+    throw new Error(`entry ${name} 声明了 ZIP64 但 extra field 里没有尺寸`)
+  }
+  return { compSize, uncompSize }
+}
+
 /** 读取整个 .npz，返回 name -> array。 */
 export function loadNpz(path: string): Record<string, NpyArray> {
   const buf = readFileSync(path)
@@ -116,12 +168,21 @@ export function loadNpz(path: string): Record<string, NpyArray> {
   for (let i = 0; i + 30 <= buf.length; ) {
     if (buf.readUInt32LE(i) !== 0x04034b50) break
     const method = buf.readUInt16LE(i + 8)
-    const compSize = buf.readUInt32LE(i + 18)
-    const uncompSize = buf.readUInt32LE(i + 22)
+    const compSizeRaw = buf.readUInt32LE(i + 18)
+    const uncompSizeRaw = buf.readUInt32LE(i + 22)
     const nameLen = buf.readUInt16LE(i + 26)
     const extraLen = buf.readUInt16LE(i + 28)
     const name = buf.toString("latin1", i + 30, i + 30 + nameLen)
     const dataStart = i + 30 + nameLen + extraLen
+
+    const { compSize, uncompSize } = resolveSizes({
+      buf,
+      extraStart: i + 30 + nameLen,
+      extraLen,
+      compSizeRaw,
+      uncompSizeRaw,
+      name,
+    })
     const raw = buf.subarray(dataStart, dataStart + compSize)
 
     let body: Buffer

@@ -51,7 +51,8 @@ import { loadWSplatScene } from "./utils/wsplat-scene.ts"
 const CLI_OPTIONS = {
   widths: { type: "string" },
   eps2d: { type: "string" },
-  "no-photo": { type: "boolean" },
+  /** 与原图对比那一栏；`--no-photo` 关。 */
+  photo: { type: "boolean", default: true },
   image: { type: "string" },
 } as const
 
@@ -85,6 +86,7 @@ async function main(): Promise<void> {
     args: process.argv.slice(2),
     options: CLI_OPTIONS,
     allowPositionals: false,
+    allowNegative: true,
     strict: true,
   })
   const eps2d = Number.parseFloat(args.values.eps2d ?? "0.3")
@@ -99,8 +101,7 @@ async function main(): Promise<void> {
   const nativeHeight = pose.height
 
   const photoPath = resolve(REPO_ROOT, args.values.image ?? DEFAULT_IMAGE)
-  const photo =
-    args.values["no-photo"] === true ? undefined : await loadImage(photoPath)
+  const photo = args.values.photo ? await loadImage(photoPath) : undefined
 
   console.log("=".repeat(96))
   console.log("分辨率扫描：剔除构成 + GPU/CPU 一致性 + 与原图差异")

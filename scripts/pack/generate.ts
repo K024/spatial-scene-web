@@ -7,7 +7,8 @@
  *          -> assembleWSplatScene -> renderLayerStack -> (refineLayers)
  *          -> toMeshingInput -> buildMeshScene -> exportMeshSceneToGlb
  * ```
- * webui 只调用这里的两个函数；推理与分层/mesh 的细节都在各自模块里。
+ * 调用方（`scripts/pack/sample.ts`、后续的 UI 入口）只需要这里的两个函数；
+ * 推理与分层/mesh 的细节都在各自模块里。
  *
  * ── 为什么不落 PLY ──
  * 推理产物直接在内存里装配成 `WSplatScene`（`assembleWSplatScene`），
@@ -18,6 +19,7 @@ import { basename } from "node:path"
 import { superSplatCameraPose } from "../../src/spatial-scene/export/camera.ts"
 import { runSharp } from "../../src/spatial-scene/infer/index.ts"
 import type {
+  CreateSession,
   ExecutionProviderHint,
   SessionCapabilities,
 } from "../../src/spatial-scene/infer/session.ts"
@@ -62,6 +64,12 @@ export interface InferSceneOptions {
   ep?: ExecutionProviderHint
   /** 模型路径；缺省 fp16。 */
   modelPath?: string
+  /**
+   * 会话工厂；缺省 `scripts/utils/platform.node.ts` 的实现。
+   *
+   * 用于计时（会话加载单独量一次）与测试注入。
+   */
+  createSession?: CreateSession
   /** 阶段进度（可选）。 */
   onStage?: StageProgress
 }
@@ -74,6 +82,9 @@ export interface InferredScene {
   readonly pose: CameraPose
   readonly loaded: LoadedImage
   readonly capabilities: SessionCapabilities
+  /** 会话加载（模型读盘 + EP 初始化）耗时（ms）。`inferMs` **含**它。 */
+  readonly sessionLoadMs: number
+  /** 载入图片 + 会话加载 + 前向 + 反投影的总耗时（ms）。 */
   readonly inferMs: number
   readonly gaussianCount: number
   /** 推理得到的反投影矩阵（4x4 行主序），调试用。 */
@@ -97,6 +108,17 @@ export async function inferSceneFromImage(
   await options.onStage?.("载入图片")
   const loaded = await loadImage(options.imagePath)
   const { createNodeSession } = await import("../utils/platform.node.ts")
+  const createSession = options.createSession ?? createNodeSession
+
+  // 会话加载（读模型 + 建 EP 会话）单独计时：它是「推理耗时」里最大的一块固定成本，
+  // 与分辨率无关，混在 inferMs 里看不出到底是加载慢还是前向慢。
+  let sessionLoadMs = 0
+  const timedCreateSession: CreateSession = async (createOptions) => {
+    const t = Date.now()
+    const session = await createSession(createOptions)
+    sessionLoadMs = Date.now() - t
+    return session
+  }
 
   await options.onStage?.(
     "推理",
@@ -107,7 +129,7 @@ export async function inferSceneFromImage(
     image: loaded.image,
     fPx: loaded.fPx,
     imageWidth: loaded.image.width,
-    createSession: createNodeSession,
+    createSession: timedCreateSession,
     model: { modelPath: options.modelPath ?? MODEL_FP16 },
     provider: options.ep ?? "auto",
   })
@@ -130,6 +152,7 @@ export async function inferSceneFromImage(
     pose,
     loaded,
     capabilities: result.capabilities,
+    sessionLoadMs,
     inferMs,
     gaussianCount: result.metric.opacities.length,
     unprojectionMatrix: result.unprojectionMatrix,

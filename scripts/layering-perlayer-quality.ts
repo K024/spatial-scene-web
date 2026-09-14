@@ -321,6 +321,7 @@ async function main(): Promise<void> {
     args: process.argv.slice(2),
     options: CLI,
     allowPositionals: false,
+    allowNegative: true,
     strict: true,
   })
   const width = Number(args.values.width ?? 768)

@@ -42,14 +42,19 @@
  * 用法：
  *   npx tsx scripts/layering-golden.ts                # 全跑（含 GPU 的 E2），最慢
  *   npx tsx scripts/layering-golden.ts --no-real      # 跳过 example.ply 读取
- *   npx tsx scripts/layering-golden.ts --no-gpu       # 只跑纯 CPU 的 A 段（秒级）
+ *   npx tsx scripts/layering-golden.ts --no-gpu       # 跳过 E2 渲染；A 段全跑（含 A4）
+ *   npx tsx scripts/layering-golden.ts --no-gpu --no-real   # 纯 CPU、不需要任何 fixture
  *   npx tsx scripts/layering-golden.ts --width 384    # E2 快速迭代
  *   npx tsx scripts/layering-golden.ts --ply py-models/out/ply/pier.ply
+ *
+ * `--no-gpu` 只关掉 E2，**A4 仍要读 fixture**（它是纯 CPU，但要 `example.ply`）；
+ * 想完全不依赖 fixture 就再加 `--no-real`。
  *
  * `--ply` 换 fixture（默认 `example.ply`）。E2 的无损性与哪张图无关，
  * 但 A4 的分布指纹（视差占用、空层、前密顺序）会变，换图后要重新看一遍。
  */
 
+import { parseArgs } from "node:util"
 import {
   buildLayerPermutation,
   buildLayerPermutationFromAssignment,
@@ -96,6 +101,7 @@ import type {
   WSplatFrame,
   WSplatStats,
 } from "../src/spatial-scene/wsplat/types.ts"
+import { numFlag } from "./utils/common.ts"
 import { withNodeDevice } from "./utils/webgpu.ts"
 import { loadWSplatScene } from "./utils/wsplat-scene.ts"
 
@@ -1572,12 +1578,22 @@ function clamp01(value: number): number {
 // ────────────────────────────── main ──────────────────────────────
 
 async function main(): Promise<void> {
-  const noReal = process.argv.includes("--no-real")
-  const noGpu = process.argv.includes("--no-gpu")
-  const widthFlag = process.argv.indexOf("--width")
-  const width = widthFlag >= 0 ? Number(process.argv[widthFlag + 1]) : 768
-  const plyFlag = process.argv.indexOf("--ply")
-  const plyPath = plyFlag >= 0 ? process.argv[plyFlag + 1] : undefined
+  const { values } = parseArgs({
+    args: process.argv.slice(2),
+    options: {
+      real: { type: "boolean", default: true },
+      gpu: { type: "boolean", default: true },
+      width: { type: "string" },
+      ply: { type: "string" },
+    },
+    allowPositionals: false,
+    allowNegative: true,
+    strict: true,
+  })
+  const noReal = !values.real
+  const noGpu = !values.gpu
+  const width = numFlag("--width", values.width, 768)
+  const plyPath = values.ply
   console.log("=".repeat(78))
   console.log("layering golden 门（A 段：统计 / 放置 / 分带）")
   console.log("=".repeat(78))

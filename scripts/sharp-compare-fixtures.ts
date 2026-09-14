@@ -21,6 +21,7 @@
 
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
+import { parseArgs } from "node:util"
 
 import { gaussiansToPly } from "../src/spatial-scene/export/ply.ts"
 import { runSharp } from "../src/spatial-scene/infer/index.ts"
@@ -148,7 +149,14 @@ function get(
 }
 
 async function main(): Promise<void> {
-  const noInfer = process.argv.includes("--no-infer")
+  const { values } = parseArgs({
+    args: process.argv.slice(2),
+    options: { infer: { type: "boolean", default: true } },
+    allowPositionals: false,
+    allowNegative: true,
+    strict: true,
+  })
+  const noInfer = !values.infer
 
   console.log("=".repeat(76))
   console.log("JS vs PyTorch 数值对拍")

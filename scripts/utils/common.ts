@@ -5,7 +5,7 @@
  * 而不是散落在各脚本里。任何需要 ort 的脚本**必须**先调用
  * `prepareOrtEnv()`，它保证 patch 在 ort 模块求值前生效。
  *
- * 注意：`src/spatial-scene/infer/platform.node.ts` 内部也做了同样的 patch
+ * 注意：`scripts/utils/platform.node.ts` 内部也做了同样的 patch
  * （因为它用动态 import，能自保证顺序）。两处幂等，重复调用无害。
  * 之所以这里再放一份，是为了让「脚本里直接 require ort」的场景也安全。
  */
@@ -83,6 +83,29 @@ export function requireFile(path: string, label: string): string {
     throw new Error(`${label} 不存在: ${path}`)
   }
   return path
+}
+
+/**
+ * 解析数值 flag。
+ *
+ * flag 缺省时用 `fallback`；**给了值但不是数字就抛** —— 不要让 `NaN` 静默流进
+ * 下游（`--width abc` 会一路变成负尺寸的画布，报错信息还指不到命令行）。
+ *
+ * @param flag flag 名（只用于报错，例如 `"--width"`）。
+ * @param raw `parseArgs` 拿到的字符串值。
+ * @param fallback flag 缺省时的取值。
+ */
+export function numFlag(
+  flag: string,
+  raw: string | undefined,
+  fallback: number,
+): number {
+  if (raw === undefined) return fallback
+  const value = Number(raw)
+  if (!Number.isFinite(value)) {
+    throw new Error(`${flag} 需要一个数字（收到 "${raw}"）`)
+  }
+  return value
 }
 
 /** 人类可读的文件大小。 */

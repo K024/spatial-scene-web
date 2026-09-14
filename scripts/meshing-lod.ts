@@ -17,6 +17,7 @@
  *   npx tsx scripts/meshing-lod.ts --ply py-models/out/ply/example.ply --width 768 --layers 8
  */
 
+import { parseArgs } from "node:util"
 import { ndcDepthFromZ } from "../src/spatial-scene/layering/disparity-stats.ts"
 import {
   buildMeshScene,
@@ -30,34 +31,55 @@ import {
   type LodOptions,
 } from "../src/spatial-scene/meshing/lod.ts"
 import type { LayerMesh } from "../src/spatial-scene/meshing/types.ts"
+import { numFlag } from "./utils/common.ts"
 import { rasterizeLayerMesh } from "./utils/meshing-cpu.ts"
 import { renderLayerStack } from "./utils/meshing-scene.ts"
 import { withNodeDevice } from "./utils/webgpu.ts"
 import { maskedMae, maskedNcc, toGray } from "./utils/wsplat-metrics.ts"
 import { loadWSplatScene } from "./utils/wsplat-scene.ts"
 
+/**
+ * 命令行参数（flag 与缺省值见 {@link CLI_OPTIONS}）。
+ *
+ * 只跑合成段时用 `--synthetic`；否则走真实 PLY（`--ply / --width / --layers`）。
+ */
 interface Args {
+  /** 只跑 A 段（合成输入，纯 CPU）。 */
   synthetic: boolean
+  /** fixture PLY（相对路径按仓库根解释）。 */
   ply: string
+  /** 渲染宽度。 */
   width: number
+  /** 层数。 */
   layers: number
 }
 
-function parseArgs(argv: readonly string[]): Args {
-  const args: Args = {
-    synthetic: false,
-    ply: "py-models/out/ply/example.ply",
-    width: 768,
-    layers: 8,
+/**
+ * 命令行声明（**缺省值只写在这里**，避免与 `Args` 的注释两处漂移）。
+ *
+ * flag 名保持 kebab-case：`parseArgs` 没有别名，option 名就是 flag 名。
+ */
+const CLI_OPTIONS = {
+  synthetic: { type: "boolean", default: false },
+  ply: { type: "string", default: "py-models/out/ply/example.ply" },
+  width: { type: "string" },
+  layers: { type: "string" },
+} as const
+
+function parseCli(argv: readonly string[]): Args {
+  const { values } = parseArgs({
+    args: [...argv],
+    options: CLI_OPTIONS,
+    allowPositionals: false,
+    allowNegative: true,
+    strict: true,
+  })
+  return {
+    synthetic: values.synthetic,
+    ply: values.ply,
+    width: numFlag("--width", values.width, 768),
+    layers: numFlag("--layers", values.layers, 8),
   }
-  for (let i = 0; i < argv.length; i++) {
-    const next = () => argv[++i]
-    if (argv[i] === "--synthetic") args.synthetic = true
-    else if (argv[i] === "--ply") args.ply = next()
-    else if (argv[i] === "--width") args.width = Number(next())
-    else if (argv[i] === "--layers") args.layers = Number(next())
-  }
-  return args
 }
 
 /** 包一个 `LayerMesh` 形状的壳给光栅器用（LOD 结果不实现完整契约）。 */
@@ -436,7 +458,7 @@ async function runReal(args: Args): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2))
+  const args = parseCli(process.argv.slice(2))
   if (args.synthetic) {
     runSynthetic()
     return

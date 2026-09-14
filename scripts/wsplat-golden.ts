@@ -113,7 +113,8 @@ const GATES = {
 const CLI_OPTIONS = {
   width: { type: "string" },
   eps2d: { type: "string" },
-  "no-photo": { type: "boolean" },
+  /** 与原图对比（E 段）；`--no-photo` 关。 */
+  photo: { type: "boolean", default: true },
   image: { type: "string" },
 } as const
 
@@ -136,6 +137,7 @@ async function main(): Promise<void> {
     args: process.argv.slice(2),
     options: CLI_OPTIONS,
     allowPositionals: false,
+    allowNegative: true,
     strict: true,
   })
   const eps2d = Number.parseFloat(args.values.eps2d ?? "0.3")
@@ -378,7 +380,7 @@ async function main(): Promise<void> {
     }
 
     // ── E. 与原图对比 ──
-    if (args.values["no-photo"] !== true) {
+    if (args.values.photo) {
       console.log("\n[E] 与原图对比（画面级证据）")
       const photoPath = resolve(REPO_ROOT, args.values.image ?? DEFAULT_IMAGE)
       const photo = await loadImage(photoPath)

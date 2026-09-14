@@ -76,9 +76,10 @@ const CLI = {
   method: { type: "string" },
   out: { type: "string" },
   ply: { type: "string" },
-  "no-tinted": { type: "boolean" },
-  /** 跳过逐层 rgba/d 图（只出 PLY）。 */
-  "no-images": { type: "boolean" },
+  /** `tinted.ply`（全层染色，看层带）；`--no-tinted` 关。 */
+  tinted: { type: "boolean", default: true },
+  /** 逐层 rgba/d 图；`--no-images` 关（只出 PLY）。 */
+  images: { type: "boolean", default: true },
   /** 逐层 rgba/d 图的渲染宽度（PLY 头与 camera.json 用**原图域**，不受影响）。 */
   width: { type: "string" },
   full: { type: "boolean" },
@@ -239,6 +240,7 @@ async function main(): Promise<void> {
     args: process.argv.slice(2),
     options: CLI,
     allowPositionals: false,
+    allowNegative: true,
     strict: true,
   })
   const layerCounts = (args.values.layers ?? "16")
@@ -246,8 +248,8 @@ async function main(): Promise<void> {
     .map((s) => Number(s.trim()))
     .filter((n) => Number.isInteger(n) && n > 0)
   const method = (args.values.method ?? "quantile") as LayerSamplingMethod
-  const writeTinted = args.values["no-tinted"] !== true
-  const writeImages = args.values["no-images"] !== true
+  const writeTinted = args.values.tinted
+  const writeImages = args.values.images
   const fullMode = args.values.full === true
   const renderWidth = String(args.values.width ?? 1024)
   const outRoot = resolve(REPO_ROOT, args.values.out ?? "temp/layers-ply")
