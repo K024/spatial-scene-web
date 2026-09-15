@@ -25,3 +25,6 @@ temp
 *.sw?
 *.ply
 *.glb
+
+# ignore generated files
+public/exports/

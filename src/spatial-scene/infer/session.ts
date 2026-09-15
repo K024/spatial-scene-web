@@ -174,15 +174,24 @@ export function f16ToF32(h: number): number {
       I32_SCRATCH_OUT[0] = sign
       return F32_SCRATCH_OUT[0]
     }
-    // subnormal：正规化
+    // subnormal：fp16 的 subnormal 值为 `mant * 2^-24`。
+    //
+    // 先左移到隐含 1（bit10）置位：设左移 k 次后停下，则
+    //     value = 1.f * 2^(-14-k)   ⇒   f32 指数域 = 127 - 14 - k
+    //
+    // ⚠ 此处曾经是 off-by-one（写成 `127 - 15 + e + 1`，e 从 -1 起），
+    // 结果比真值**小一半**。而 SHARP 的输出恰好大量落在 subnormal 区间
+    // （opacity / singular_values / 近零色彩 < 2^-14 = 6.1e-5）——
+    // 也就是说所有「几乎透明」的高斯都会被读成一半的不透明度。
+    // 该 bug 由 `scripts/sharp-compare-fixtures.ts` 的 fp16 用例发现。
     let m = mant
-    let e = -1
+    let k = 0
     while ((m & 0x400) === 0) {
       m <<= 1
-      e--
+      k++
     }
     m &= 0x3ff
-    const exp32 = (127 - 15 + e + 1) << 23
+    const exp32 = (127 - 14 - k) << 23
     I32_SCRATCH_OUT[0] = sign | exp32 | (m << 13)
     return F32_SCRATCH_OUT[0]
   }
