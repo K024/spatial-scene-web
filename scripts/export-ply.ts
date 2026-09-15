@@ -22,7 +22,7 @@
  *   SHARP_ORT_LOG   ort 日志级别（默认 error）
  */
 
-import { mkdirSync, writeFileSync } from "node:fs"
+import { copyFileSync, mkdirSync, writeFileSync } from "node:fs"
 import { basename, dirname, resolve } from "node:path"
 import { parseArgs } from "node:util"
 
@@ -250,6 +250,12 @@ async function main(): Promise<void> {
   writeFileSync(cameraPath, superSplatCameraJson([pose]))
   console.log(`[4/4] 相机 json 已写`)
 
+  // 参考照片也复制一份到产物目录：sidecar 里的 `img_name` 指向它，
+  // web 侧拿来做「渲染结果 vs 原图」的叠加/闪烁比对。
+  const refImagePath = resolve(dirname(outPath), basename(imagePath))
+  copyFileSync(imagePath, refImagePath)
+  console.log(`      参考照片已复制 ${refImagePath}`)
+
   console.log("")
   // rotation 的第 3 列即相机朝向（同 `camera.ts: cameraPoseFromExtrinsics`）
   const forward = pose.rotation[2]
@@ -263,6 +269,7 @@ async function main(): Promise<void> {
   console.log(
     `产物: ${outPath} (${humanSize(ply.byteLength)})  +  ${cameraPath}`,
   )
+  console.log(`      ${refImagePath}`)
   console.log(
     "提示: 拖入 https://superspl.at/editor 后，先导入相机 json 再导入 PLY，即可回到原图视角。",
   )
