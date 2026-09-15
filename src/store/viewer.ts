@@ -11,6 +11,7 @@
 import "./signals-hook.ts"
 import { signal } from "@preact/signals-react"
 import type {
+  FrameStats,
   PipelineMode,
   RenderParams,
   SplatRenderer,
@@ -107,6 +108,8 @@ export interface ViewStats {
   gpu: DistStats
   /** 本环境是否拿得到硬件计时（动态判定：拿到过有效值）。 */
   gpuTimingAvailable: boolean
+  /** 窗口内被跳过的空闲帧数（见 {@link idleSkip}）。 */
+  idle: number
   /** 窗口内被排除的长停顿次数（> {@link MAX_SANE_FRAME_MS}，多半是切标签页）。 */
   stalls: number
   /** 实际渲染分辨率。 */
@@ -158,11 +161,18 @@ const MAX_SAMPLES = 8192
 /**
  * 一个采样点。
  *
- * `frameMs = 0` 是一个哨兵：表示这次是长停顿（见 {@link MAX_SANE_FRAME_MS}），
- * 只计入 `stalls`，不进分布；`gpuMs = null` 表示本帧没取到新的计时结果。
+ * 三种帧分开统计，而不是靠魔法值区分：
+ * - `frame`：真正提交了绘制的帧
+ * - `stall`：帧间隔 > {@link MAX_SANE_FRAME_MS} 的帧（切标签页/断点），
+ *   只计数不进分布
+ * - `idle`：被空闲跳过、根本没渲染的帧（见 {@link idleSkip}）
  */
+type SampleKind = "frame" | "stall" | "idle"
+
 interface Sample {
   t: number
+  kind: SampleKind
+  /** 与上一个**渲染帧**的间隔（ms）；无有效间隔（首帧/刚从空闲恢复）时为 0。 */
   frameMs: number
   cpuMs: number
   gpuMs: number | null
@@ -172,8 +182,8 @@ let samples: Sample[] = []
 /** 最近一次求分布的时间：分布本身不用每帧算，但样本必须每帧收。 */
 let lastDistMs = -Infinity
 const EMPTY_DISTS = { frame: EMPTY_DIST, cpu: EMPTY_DIST, gpu: EMPTY_DIST }
-/** 分布缓存（含窗口内长停顿计数）。 */
-let distCache = { ...EMPTY_DISTS, stalls: 0 }
+/** 分布缓存（含窗口内长停顿与空闲跳过计数）。 */
+let distCache = { ...EMPTY_DISTS, stalls: 0, idle: 0 }
 
 /**
  * 分位数（最近邻次序统计量）。
@@ -211,13 +221,19 @@ function recomputeDistributions(now: number): void {
   const cpu: number[] = []
   const gpu: number[] = []
   let stalls = 0
+  let idle = 0
   for (const s of samples) {
-    if (s.frameMs === 0) {
+    if (s.kind === "idle") {
+      idle++
+      continue
+    }
+    if (s.kind === "stall") {
       stalls++
       continue
     }
-    frame.push(s.frameMs)
     cpu.push(s.cpuMs)
+    // 帧间隔只在「上一个采样点也是渲染帧」时才有意义
+    if (s.frameMs > 0) frame.push(s.frameMs)
     if (s.gpuMs !== null) gpu.push(s.gpuMs)
   }
   distCache = {
@@ -225,6 +241,7 @@ function recomputeDistributions(now: number): void {
     cpu: dist(cpu),
     gpu: dist(gpu),
     stalls,
+    idle,
   }
   lastDistMs = now
 }
@@ -233,7 +250,7 @@ function recomputeDistributions(now: number): void {
 export function resetStats(): void {
   samples = []
   lastDistMs = -Infinity
-  distCache = { ...EMPTY_DISTS, stalls: 0 }
+  distCache = { ...EMPTY_DISTS, stalls: 0, idle: 0 }
 }
 
 export const viewStats = signal<ViewStats>({
@@ -244,6 +261,7 @@ export const viewStats = signal<ViewStats>({
   gpu: EMPTY_DIST,
   gpuTimingAvailable: false,
   stalls: 0,
+  idle: 0,
   width: 1,
   height: 1,
   splats: 0,
@@ -274,10 +292,37 @@ let rafId = 0
 let lastStepMs = 0
 /** 上一帧的起始时间戳（统计帧间隔用；与 `lastStepMs` 分开，各自用途不同）。 */
 let lastFrameMs = 0
+/** 上一帧的画面指纹；空闲期间保持相等（见 {@link idleSkip}）。 */
+let lastFingerprint: string | null = null
+/** 最近一次渲染帧的统计（空闲期间沿用）。 */
+let rendererStats: FrameStats | null = null
 /** 最近一次的顶点缓冲：即使渲染器还没挂载（或热更新重建过）也不丢数据。 */
 let latest: PackedSplats | null = null
 /** 点击「暂停」后停止 rAF（省电；也便于观察单帧耗时）。 */
 export const paused = signal(false)
+
+/**
+ * 空闲时跳过渲染（默认开）。
+ *
+ * 触发条件：**所有影响画面的输入都没变**——相机姿态（缓动已到位、且不在自动/
+ * 视差驱动中）、全部渲染参数、叠加相位、画布尺寸、顶点缓冲。因此：
+ * - 自由模式停手、视差模式鼠标不动 → 停绘（这两个是绝大多数时间的状态）
+ * - 自动模式 / 闪烁比对 → 永远在变，不会停
+ * - 改任何滑杆 / 切管线 / 重新排序 → 下一帧立刻恢复
+ *
+ * 注意 rAF **没有**停：每帧仍然走 `buildParams()`（缓动必须继续推进）
+ * 与一次指纹比较（几十纳秒），代价远低于一次 draw。这样「恢复」不需要
+ * 任何事件接线——输入写信号，下一帧指纹就对不上了。
+ */
+export const idleSkip = signal(true)
+
+/**
+ * 顶点缓冲/参考图的版本号。
+ *
+ * 这类变化不经过 `RenderParams`，所以单独计数并计入指纹：
+ * 少了它，重新排序或换场景后会停在上一次的画面。
+ */
+let dataEpoch = 0
 
 /** 面板是否展开（纯 UI 状态，但需要跨组件共享：收起后右上角要出「显示面板」按钮）。 */
 export const panelOpen = signal(true)
@@ -302,8 +347,11 @@ export function attachCanvas(canvas: HTMLCanvasElement): void {
     return
   }
   if (latest) renderer.setSplats(latest)
-  // 新渲染器：帧间隔序列从头开始，避免把重建间隙当成一次卡顿
+  // 新渲染器：帧间隔序列从头开始，避免把重建间隙当成一次卡顿；
+  // 指纹一并清空，保证新画布至少画一帧
   lastFrameMs = 0
+  lastFingerprint = null
+  rendererStats = null
   resetStats()
   loop()
 }
@@ -320,12 +368,15 @@ export function detachCanvas(): void {
 /** 把新顶点缓冲推给渲染器（未挂载时暂存，挂载时补上）。 */
 export function pushSplats(packed: PackedSplats): void {
   latest = packed
+  // 顶点缓冲变了：让空闲判定失效，下一帧必须重绘
+  dataEpoch++
   renderer?.setSplats(packed)
 }
 
 /** 设置参考图（叠加比对用）。仅在加载成功时才允许开启叠加。 */
 export function setReferenceImage(image: HTMLImageElement): void {
   renderer?.setReferenceImage(image)
+  dataEpoch++
   referenceImageReady.value = true
 }
 
@@ -388,8 +439,64 @@ export function buildParams(): RenderParams | null {
     pipeline: pipeline.value,
     overlayMode: referenceImageReady.value ? overlayMode.value : "off",
     overlayOpacity: overlayOpacity.value,
-    overlayPhase: (performance.now() % BLINK_PERIOD_MS) / BLINK_PERIOD_MS,
+    // 相位只在闪烁模式下推进：否则这个值每帧都变，空闲判定永远不成立
+    overlayPhase:
+      overlayMode.value === "blink" && referenceImageReady.value
+        ? (now % BLINK_PERIOD_MS) / BLINK_PERIOD_MS
+        : 0,
   }
+}
+
+/**
+ * 画面指纹：把「影响这一帧长什么样」的全部输入拼成一个字符串。
+ *
+ * 为什么用指纹而不是逐个信号去比：渲染参数有十几项、以后还会加，漏一项的
+ * 后果是「改了参数但画面不动」（很难查的 bug）。指纹只需在 {@link buildParams}
+ * 旁边维护一份字段清单，与参数定义贴在一起。
+ *
+ * 不计入的项（不影响画面）：空闲跳过开关本身、统计窗口、面板开关、
+ * 相机模式（模式只通过姿态影响画面）。
+ */
+function renderFingerprint(
+  p: RenderParams,
+  canvasWidth: number,
+  canvasHeight: number,
+  epoch: number,
+): string {
+  const c = p.camera
+  return [
+    // 数据 / 画布
+    epoch,
+    canvasWidth,
+    canvasHeight,
+    p.pixelRatio,
+    // 渲染参数
+    p.pipeline,
+    p.splatScale,
+    p.opacityScale,
+    p.exposure,
+    p.background,
+    p.aaMinPx,
+    p.minPx,
+    p.maxPx,
+    p.overlayMode,
+    p.overlayOpacity,
+    p.overlayPhase,
+    // 相机（姿态 + 取景）
+    c.yaw,
+    c.pitch,
+    c.distance,
+    c.pivot[0],
+    c.pivot[1],
+    c.pivot[2],
+    c.focalPx,
+    c.imageSize[0],
+    c.imageSize[1],
+    // near/far 现在是常量（NEAR / FAR），但裁剪面也在着色器里参与判定，
+    // 将来做成可调时不能忘了它们
+    c.near,
+    c.far,
+  ].join("|")
 }
 
 /** 近/远裁剪面（场景深度约 1~6 m，取足够宽的余量）。 */
@@ -404,27 +511,49 @@ function loop(): void {
   }
   const params = buildParams()
   if (params) {
-    const t0 = performance.now()
-    const s = renderer.render(params)
-    const now = performance.now()
+    // ── 空闲判定：指纹包含一切影响画面的输入 ──
+    const canvas = canvasEl
+    const fp = idleSkip.value
+      ? renderFingerprint(
+          params,
+          canvas?.clientWidth ?? 0,
+          canvas?.clientHeight ?? 0,
+          dataEpoch,
+        )
+      : null
+    const idle = fp !== null && fp === lastFingerprint
+    lastFingerprint = fp
 
-    // ── 采样（每帧都要收，否则帧间隔序列就是错的）──
-    // 第一帧没有前一帧时间戳，不采样
-    const frameMs = lastFrameMs > 0 ? t0 - lastFrameMs : 0
-    lastFrameMs = t0
-    if (frameMs > 0) {
+    const t0 = performance.now()
+    if (idle) {
+      // 不提交绘制：不打点、不进 GPU 计时队列、不占带宽
+      samples.push({ t: t0, kind: "idle", frameMs: 0, cpuMs: 0, gpuMs: null })
+      // 空闲后的第一个渲染帧没有「连续间隔」可言，避免把空闲时长
+      // 当成一次卡顿记进去
+      lastFrameMs = 0
+    } else {
+      const s = renderer.render(params)
+      const now = performance.now()
+      // 缓存下来：空闲期间面板仍然要显示分辨率/高斯数/draw call
+      rendererStats = s
+
+      // ── 采样（每个渲染帧都要收，否则帧间隔序列就是错的）──
+      // 第一帧、以及刚从空闲恢复的那帧没有有效间隔（frameMs = 0）
+      const frameMs = lastFrameMs > 0 ? t0 - lastFrameMs : 0
+      lastFrameMs = t0
       samples.push({
         t: now,
-        // 长停顿用哨兵 0 标记（不计入分布，只计数）
-        frameMs: frameMs <= MAX_SANE_FRAME_MS ? frameMs : 0,
+        kind: frameMs > MAX_SANE_FRAME_MS ? "stall" : "frame",
+        frameMs,
         cpuMs: s.cpuMs,
         gpuMs: s.gpuMs,
       })
-      if (samples.length > MAX_SAMPLES)
-        samples.splice(0, samples.length - MAX_SAMPLES)
     }
+    if (samples.length > MAX_SAMPLES)
+      samples.splice(0, samples.length - MAX_SAMPLES)
 
     // ── 限频刷新面板快照（分布每次重算：窗口滑动，旧样本随时间失效）──
+    const now = performance.now()
     if (now - lastDistMs >= STATS_PUSH_MS) {
       recomputeDistributions(now)
       const cam = renderer.camera
@@ -434,17 +563,19 @@ function loop(): void {
       const frame = distCache.frame
       viewStats.value = {
         windowMs: statsWindowMs.value,
-        // 平均帧率由**平均帧间隔**得出，不是瞬时 fps 的平均（两者不等价）
+        // 平均帧率由**渲染帧**的平均间隔得出（空闲帧不算，否则会被
+        // 「停在那儿不画」拉成 0 fps；两者含义不同，面板上也分开显示）
         fps: frame.count > 0 ? 1000 / frame.avg : 0,
         frame,
         cpu: distCache.cpu,
         gpu: distCache.gpu,
-        gpuTimingAvailable: s.gpuTimingAvailable,
+        gpuTimingAvailable: rendererStats?.gpuTimingAvailable ?? false,
         stalls: distCache.stalls,
-        width: s.width,
-        height: s.height,
-        splats: s.splats,
-        drawCalls: s.drawCalls,
+        idle: distCache.idle,
+        width: rendererStats?.width ?? 0,
+        height: rendererStats?.height ?? 0,
+        splats: rendererStats?.splats ?? 0,
+        drawCalls: rendererStats?.drawCalls ?? 0,
         sortDeviationDeg: angleBetweenDeg(
           cam.forwardPly,
           sortInfo.value?.camera.forward ?? [0, 0, 1],

@@ -8,8 +8,14 @@
 
 import { AnimatePresence, motion } from "motion/react"
 import { type LoadStage, STAGE_LABELS } from "../spatial-scene/render/types.ts"
-import { error, progress, startLoad, status } from "../store/scene.ts"
-import { Button } from "./primitives.tsx"
+import {
+  error,
+  progress,
+  reload,
+  startLoadFromFile,
+  status,
+} from "../store/scene.ts"
+import { Button, FilePickerButton } from "./primitives.tsx"
 
 /** 阶段顺序（用于把「已完成的阶段」标出来）。 */
 const STAGES: LoadStage[] = ["fetch", "parse", "convert", "sort", "pack"]
@@ -66,12 +72,15 @@ export function LoadOverlay() {
                   </code>
                   。
                 </p>
-                <div className="mt-3.5 flex justify-end">
-                  <Button
-                    variant="primary"
-                    onClick={() => void startLoad()}
-                    disabled={false}
-                  >
+                <div className="mt-3.5 flex items-center justify-end gap-2">
+                  <span className="mr-auto text-[11px] text-white/35">
+                    或直接拖一个 .ply 进来
+                  </span>
+                  <FilePickerButton
+                    label="选择 PLY 文件"
+                    onPick={(file) => void startLoadFromFile(file)}
+                  />
+                  <Button variant="primary" onClick={() => void reload()}>
                     重试
                   </Button>
                 </div>

@@ -23,10 +23,13 @@ import {
 } from "../store/camera.ts"
 import {
   meta,
-  plyUrl,
+  plyLabel,
+  plySource,
   referenceImageUrl,
+  reload,
   sortInfo,
   sorting,
+  startLoadFromFile,
   status,
   view,
 } from "../store/scene.ts"
@@ -65,6 +68,7 @@ import {
 import {
   Badge,
   Button,
+  FilePickerButton,
   PercentileTable,
   Row,
   Section,
@@ -91,12 +95,14 @@ function sampleSub(
   frameCount: number,
   gpuCount: number,
   stalls: number,
+  idle: number,
 ): string {
   const parts = [
     gpuCount > 0 ? `GPU 样本 ${gpuCount}` : "无 GPU 样本",
     "p95/p99 是次序统计量，取真实测到过的那一帧，不做插值",
   ]
   if (stalls > 0) parts.push(`已排除 ${stalls} 次 >1 s 长停顿`)
+  if (idle > 0) parts.push(`空闲跳过 ${idle} 帧（未计入帧率）`)
   void frameCount
   return parts.join(" · ")
 }
@@ -144,7 +150,8 @@ export function InfoPanel() {
     glError: rendererError.useValue(),
     refUrl: referenceImageUrl.useValue(),
     refReady: referenceImageReady.useValue(),
-    ply: plyUrl.useValue(),
+    plyLabel: plyLabel.useValue(),
+    plySource: plySource.useValue(),
     camYaw: freeYaw.useValue(),
     camPitch: freePitch.useValue(),
     camZoom: freeZoom.useValue(),
@@ -244,8 +251,33 @@ export function InfoPanel() {
         >
           <Row
             label="文件"
-            value={<span className="tnum">{basename(v.ply)}</span>}
+            value={<span className="tnum">{v.plyLabel}</span>}
+            sub={
+              v.plySource.kind === "file"
+                ? "本地文件 · 不探 sidecar（PLY 带内参则用 PLY 的）"
+                : v.plySource.url
+            }
           />
+          <div className="flex flex-wrap gap-2">
+            <FilePickerButton
+              label="选择 PLY 文件"
+              variant="primary"
+              disabled={v.loadStatus === "loading"}
+              onPick={(file) => void startLoadFromFile(file)}
+            />
+            <Button
+              disabled={v.loadStatus === "loading"}
+              onClick={() => void reload()}
+            >
+              重新加载
+            </Button>
+          </div>
+          <p className="text-[11px] leading-relaxed text-white/30">
+            也可以直接把 .ply 拖到窗口里。相机信息优先取 PLY 自带的
+            intrinsic/image_size（<code className="tnum">--full</code>
+            产物），其次同目录 sidecar json；都没有就按默认 35mm 等效焦距（30
+            mm） 反推内参，取景与默认输入图一致。
+          </p>
           <Row
             label="高斯"
             value={v.sceneMeta ? fmtInt(v.sceneMeta.count) : "—"}
@@ -638,6 +670,7 @@ export function InfoPanel() {
               v.stats.frame.count,
               v.stats.gpu.count,
               v.stats.stalls,
+              v.stats.idle,
             )}
           />
           <div className="grid grid-cols-2 gap-2">
@@ -689,9 +722,6 @@ export function InfoPanel() {
 }
 
 /** 路径末段。 */
-function basename(path: string): string {
-  return path.split("/").pop() ?? path
-}
 
 /** `2·atan(size / (2f))`，度。 */
 function fovDeg(focalPx: number, sizePx: number): number {
@@ -705,9 +735,11 @@ function rad2deg(rad: number): number {
 
 /** 焦距来源的中文标签。 */
 function focalSourceLabel(source: "ply" | "sidecar" | "fallback"): string {
-  return { ply: "PLY 内参", sidecar: "sidecar json", fallback: "兜底 40°" }[
-    source
-  ]
+  return {
+    ply: "PLY 内参",
+    sidecar: "sidecar json",
+    fallback: "兜底 30mm 等效",
+  }[source]
 }
 
 /** 「排序基线」= 原点则是参考相机。 */

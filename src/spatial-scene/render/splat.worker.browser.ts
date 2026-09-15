@@ -102,50 +102,77 @@ function sortAndPack(
   return packed
 }
 
+/**
+ * 解析 -> 颜色转换 -> 排序 -> 打包。
+ *
+ * `load`（URL）与 `loadBytes`（本地文件）共用这一段：字节从哪来不影响后面。
+ */
+async function processBytes(
+  bytes: Uint8Array,
+  onProgress: (p: LoadProgress) => void,
+  t0: number,
+): Promise<LoadResult> {
+  const tParse = performance.now()
+  onProgress({ stage: "parse", ratio: 0.2 })
+  const header = parsePlyHeader(bytes)
+  const vertex = readVertexSoA(bytes, header)
+  const meta = readAuxAndMeta(bytes, header, vertex)
+  onProgress({
+    stage: "parse",
+    ratio: 1,
+    detail: `${meta.count.toLocaleString("en-US")} 个高斯 · ${(
+      (performance.now() - tParse) / 1000
+    ).toFixed(2)} s`,
+  })
+
+  onProgress({ stage: "convert", ratio: 0.5 })
+  shDcToLinearRgb(vertex.shDc, vertex.colorLinear)
+  onProgress({ stage: "convert", ratio: 1 })
+
+  const soa: SplatSoA = {
+    count: vertex.count,
+    center: vertex.center,
+    scaleLog: vertex.scaleLog,
+    quat: vertex.quat,
+    colorLinear: vertex.colorLinear,
+    opacityLogit: vertex.opacityLogit,
+  }
+  state = soa
+
+  const packed = sortAndPack(soa, REFERENCE_CAMERA, onProgress)
+  onProgress({
+    stage: "done",
+    ratio: 1,
+    detail: `总计 ${((performance.now() - t0) / 1000).toFixed(2)} s`,
+  })
+
+  // 顶点缓冲所有权交给主线程（结构化克隆会复制 66 MB，必须转移）
+  return Comlink.transfer({ meta, packed }, [packed.data.buffer])
+}
+
 const api: SplatWorkerApi = {
   async load(
     url: string,
     onProgress: (p: LoadProgress) => void,
   ): Promise<LoadResult> {
     const t0 = performance.now()
-    const bytes = await fetchWithProgress(url, onProgress)
+    return processBytes(
+      await fetchWithProgress(url, onProgress),
+      onProgress,
+      t0,
+    )
+  },
 
-    const tParse = performance.now()
-    onProgress({ stage: "parse", ratio: 0.2 })
-    const header = parsePlyHeader(bytes)
-    const vertex = readVertexSoA(bytes, header)
-    const meta = readAuxAndMeta(bytes, header, vertex)
-    onProgress({
-      stage: "parse",
-      ratio: 1,
-      detail: `${meta.count.toLocaleString("en-US")} 个高斯 · ${(
-        (performance.now() - tParse) / 1000
-      ).toFixed(2)} s`,
-    })
-
-    onProgress({ stage: "convert", ratio: 0.5 })
-    shDcToLinearRgb(vertex.shDc, vertex.colorLinear)
-    onProgress({ stage: "convert", ratio: 1 })
-
-    const soa: SplatSoA = {
-      count: vertex.count,
-      center: vertex.center,
-      scaleLog: vertex.scaleLog,
-      quat: vertex.quat,
-      colorLinear: vertex.colorLinear,
-      opacityLogit: vertex.opacityLogit,
-    }
-    state = soa
-
-    const packed = sortAndPack(soa, REFERENCE_CAMERA, onProgress)
-    onProgress({
-      stage: "done",
-      ratio: 1,
-      detail: `总计 ${((performance.now() - t0) / 1000).toFixed(2)} s`,
-    })
-
-    // 顶点缓冲所有权交给主线程（结构化克隆会复制 66 MB，必须转移）
-    return Comlink.transfer({ meta, packed }, [packed.data.buffer])
+  /** 本地文件（拖拽 / 文件选择）：字节已由主线程读好并**转移**过来。 */
+  async loadBytes(
+    buffer: ArrayBuffer,
+    onProgress: (p: LoadProgress) => void,
+  ): Promise<LoadResult> {
+    const t0 = performance.now()
+    const bytes = new Uint8Array(buffer)
+    // 没有下载阶段，直接标成完成，进度列表不会卡在第一项
+    onProgress({ stage: "fetch", ratio: 1, detail: mb(bytes.byteLength) })
+    return processBytes(bytes, onProgress, t0)
   },
 
   async resort(camera: SortCamera): Promise<PackedSplats> {

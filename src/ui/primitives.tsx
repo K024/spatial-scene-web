@@ -6,7 +6,7 @@
  * 也让 React Compiler 的依赖分析保持在调用方一处。
  */
 
-import { Fragment, type ReactNode } from "react"
+import { Fragment, type ReactNode, useRef } from "react"
 
 /** 面板分组标题 + 内容。 */
 export function Section({
@@ -351,5 +351,52 @@ export function PercentileTable({
         ))}
       </div>
     </div>
+  )
+}
+
+/**
+ * 「选择 PLY 文件」按钮：本体是 `<button>`，旁边挂一个隐藏的 `<input type="file">`。
+ *
+ * 为什么要包一层而不是直接用 input：`<input type="file">` 的外观在各浏览器里
+ * 不可控（连 `::file-selector-button` 也只能改一部分），与本项目的玻璃语言冲突。
+ *
+ * 注意 `value = ""` 的重置：不清空的话，连续选同一个文件不会再触发 `change`。
+ */
+export function FilePickerButton({
+  label,
+  onPick,
+  variant = "ghost",
+  accept = ".ply",
+  disabled,
+}: {
+  label: string
+  onPick: (file: File) => void
+  variant?: "ghost" | "primary" | "warn"
+  accept?: string
+  disabled?: boolean
+}) {
+  const input = useRef<HTMLInputElement>(null)
+  return (
+    <>
+      <Button
+        variant={variant}
+        disabled={disabled}
+        onClick={() => input.current?.click()}
+      >
+        {label}
+      </Button>
+      <input
+        ref={input}
+        type="file"
+        accept={accept}
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files?.[0]
+          // 先清空再回调：回调里可能同步触发重渲染，留着值会挡住下次选择
+          e.target.value = ""
+          if (file) onPick(file)
+        }}
+      />
+    </>
   )
 }

@@ -141,6 +141,14 @@ export interface LoadResult {
 export interface SplatWorkerApi {
   /** 下载 -> 解析 -> 转换 -> 排序 -> 打包；worker 内部保留中间结果供重排序。 */
   load(url: string, onProgress: (p: LoadProgress) => void): Promise<LoadResult>
+  /**
+   * 同上，但字节由主线程提供（拖拽 / 文件选择）。
+   * `buffer` 会被**转移**（零拷贝）——主线程交出所有权后不应再碰它。
+   */
+  loadBytes(
+    buffer: ArrayBuffer,
+    onProgress: (p: LoadProgress) => void,
+  ): Promise<LoadResult>
   /** 用新相机重排序（不重新下载/解析）。 */
   resort(camera: SortCamera): Promise<PackedSplats>
   dispose(): void

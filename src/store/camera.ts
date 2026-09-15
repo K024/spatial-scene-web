@@ -114,6 +114,9 @@ export interface Pose {
 /** 实际姿态：**故意不是 signal**（每帧变化，见文件头注释）。 */
 const applied: Pose = { yaw: 0, pitch: 0, zoom: 1 }
 
+/** 缓动吸附阈值（见 `stepCamera`）。 */
+const SNAP_EPS = 1e-6
+
 /** 自动视差的相位起点（进入自动模式或复位时重置，保证运动可预期）。 */
 let autoStartMs = 0
 
@@ -125,10 +128,17 @@ export function desiredPose(nowMs: number, out: Pose = desireScratch): Pose {
   const mode = cameraMode.peek()
   if (mode === "parallax") {
     const amp = deg2rad(parallaxAmplitude.peek())
-    // 指针向右 -> 相机向右移：等价于「看向哪边就把头移向哪边」，与
-    // 3DS / iOS 空间照片的视差方向一致（注意与拖拽的「抓取」方向相反）。
-    out.yaw = clamp(pointerX.peek(), -1, 1) * amp
-    out.pitch = clamp(pointerY.peek(), -1, 1) * -amp * PITCH_RATIO
+    // 方向：两个轴都是「画面跟着指针走」（与自由模式的拖拽同一个约定）。
+    //
+    // 水平：指针向右 -> 相机向左移（yaw 减小）-> 近处内容在画面里向右跑。
+    // 垂直稍微绕一点，推导一下：指针向下 -> 相机抬高（pitch 增大）；
+    // 相机抬高后，物体的视方向 (y_obj - y_eye) 变小，且越近的高斯视差越大
+    // —— 于是近处内容在画面里**向下**跑，同样是指针方向。
+    //
+    // 之前用的是反向的「探头」约定（指针向右 -> 相机跟着向右，近处内容往
+    // 反方向跑），实测手感不符习惯，两个轴一起反了。
+    out.yaw = clamp(pointerX.peek(), -1, 1) * -amp
+    out.pitch = clamp(pointerY.peek(), -1, 1) * amp * PITCH_RATIO
   } else if (mode === "auto") {
     const amp = deg2rad(autoAmplitude.peek())
     const period = Math.max(1, autoPeriod.peek())
@@ -180,6 +190,15 @@ export function stepCamera(dtMs: number, nowMs: number): Readonly<Pose> {
   applied.yaw += (desire.yaw - applied.yaw) * alpha
   applied.pitch += (desire.pitch - applied.pitch) * alpha
   applied.zoom += (desire.zoom - applied.zoom) * alpha
+
+  // 吸附到目标：指数（有理式）缓动是渐近的，靠浮点精度自然停下来要好几秒，
+  // 期间每帧都在渲染几乎看不见的变化。超过阈值就跳到精确值。
+  // 阈值 1e-6 rad ≈ 0.00006°（屏幕上约 0.002 px），肉眼看不出差异。
+  if (Math.abs(desire.yaw - applied.yaw) < SNAP_EPS) applied.yaw = desire.yaw
+  if (Math.abs(desire.pitch - applied.pitch) < SNAP_EPS)
+    applied.pitch = desire.pitch
+  if (Math.abs(desire.zoom - applied.zoom) < SNAP_EPS)
+    applied.zoom = desire.zoom
   return applied
 }
 

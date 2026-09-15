@@ -13,9 +13,9 @@
  */
 
 import { AnimatePresence, motion } from "motion/react"
-import { useEffect } from "react"
+import { useEffect, useRef, useState } from "react"
 import { cameraMode, cycleCameraMode, resetCamera } from "./store/camera.ts"
-import { meta, status } from "./store/scene.ts"
+import { meta, startLoadFromFile, status } from "./store/scene.ts"
 import { overlayMode, panelOpen, paused, togglePaused } from "./store/viewer.ts"
 import { CanvasStage } from "./ui/CanvasStage.tsx"
 import { fmtInt } from "./ui/format.ts"
@@ -31,6 +31,47 @@ export default function App() {
   const sceneMeta = meta.useValue()
   const isPaused = paused.useValue()
   const mode = cameraMode.useValue()
+
+  // ── 拖拽放置 ──
+  // `dragenter/leave` 会在子元素之间反复触发，所以用深度计数而不是布尔值，
+  // 否则鼠标从画布移到提示卡片上，提示就会闪一下。
+  const [dropping, setDropping] = useState(false)
+  const [dropType, setDropType] = useState<string | null>(null)
+  const dragDepth = useRef(0)
+
+  function onDragEnter(e: React.DragEvent) {
+    if (!e.dataTransfer?.types.includes("Files")) return
+    e.preventDefault()
+    dragDepth.current += 1
+    setDropping(true)
+  }
+
+  function onDragOver(e: React.DragEvent) {
+    if (!e.dataTransfer?.types.includes("Files")) return
+    // 不 preventDefault 的话浏览器会直接导航到文件（整页跳走）
+    e.preventDefault()
+    e.dataTransfer.dropEffect = "copy"
+    // 拖拽阶段拿不到文件名（.ply 的 MIME 通常为空），只能拿个大概
+    const item = e.dataTransfer.items?.[0]
+    if (item?.kind === "file" && item.type) setDropType(item.type)
+  }
+
+  function onDragLeave() {
+    dragDepth.current = Math.max(0, dragDepth.current - 1)
+    if (dragDepth.current === 0) {
+      setDropping(false)
+      setDropType(null)
+    }
+  }
+
+  function onDrop(e: React.DragEvent) {
+    e.preventDefault()
+    dragDepth.current = 0
+    setDropping(false)
+    setDropType(null)
+    const file = e.dataTransfer?.files?.[0]
+    if (file) void startLoadFromFile(file)
+  }
 
   // 全局快捷键（输入框聚焦时不拦截）
   useEffect(() => {
@@ -65,7 +106,13 @@ export default function App() {
   }, [])
 
   return (
-    <div className="relative h-full w-full overflow-hidden bg-[#05060a] text-white">
+    <div
+      className="relative h-full w-full overflow-hidden bg-[#05060a] text-white"
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
       <CanvasStage />
 
       {/* ── 左上：场景 chip ── */}
@@ -165,6 +212,42 @@ export default function App() {
       </AnimatePresence>
 
       <LoadOverlay />
+
+      {/* ── 拖拽放置提示（盖在最上层，不抢指针事件）── */}
+      <AnimatePresence>
+        {dropping ? (
+          <motion.div
+            key="drop"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.16 }}
+            className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center p-6"
+          >
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-[3px]" />
+            <motion.div
+              initial={{ scale: 0.98, y: 8 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.99, y: 4 }}
+              transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+              className="glass relative flex flex-col items-center gap-2 rounded-2xl border-2 border-dashed border-accent-400/45 px-10 py-8 text-center"
+            >
+              <span className="text-[15px] font-medium text-white/90">
+                松开以载入 PLY
+              </span>
+              <span className="max-w-[286px] text-[11.5px] leading-relaxed text-white/50">
+                支持 3DGS PLY。带内参（--full）就用 PLY 里的；没有相机信息时按
+                没有相机信息时按默认 30 mm 等效焦距反推，参考图比对自动关闭。
+              </span>
+              {dropType ? (
+                <span className="tnum text-[11px] text-white/30">
+                  {dropType}
+                </span>
+              ) : null}
+            </motion.div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
     </div>
   )
 }
