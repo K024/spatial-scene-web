@@ -33,7 +33,9 @@ import {
 import {
   aaMinPx,
   background,
+  type DistStats,
   exposure,
+  floatRTUnavailable,
   gpuName,
   maxPx,
   minPx,
@@ -41,11 +43,14 @@ import {
   overlayMode,
   overlayOpacity,
   panelOpen,
+  pipeline,
   referenceImageReady,
   rendererError,
   reSortNow,
   resolutionScale,
+  STATS_WINDOWS,
   splatScale,
+  statsWindowMs,
   viewStats,
 } from "../store/viewer.ts"
 import {
@@ -60,6 +65,7 @@ import {
 import {
   Badge,
   Button,
+  PercentileTable,
   Row,
   Section,
   Segmented,
@@ -68,12 +74,53 @@ import {
   Toggle,
 } from "./primitives.tsx"
 
+/**
+ * 分布 -> 表格一行（与 `PERF_COLUMNS` 一一对应）。
+ * 不可用时给出同样长度的 `null` 行（保持网格对齐）。
+ */
+function distRow(d: DistStats, digits = 2): (string | null)[] {
+  if (d.count === 0) return PERF_COLUMNS.map(() => null)
+  return [d.avg, d.p50, d.p95, d.p99, d.max].map((x) => fmtNum(x, digits))
+}
+
+/** 性能表格的列。 */
+const PERF_COLUMNS = ["平均", "p50", "p95", "p99", "最大"]
+
+/** 样本数一行下面的说明。 */
+function sampleSub(
+  frameCount: number,
+  gpuCount: number,
+  stalls: number,
+): string {
+  const parts = [
+    gpuCount > 0 ? `GPU 样本 ${gpuCount}` : "无 GPU 样本",
+    "p95/p99 是次序统计量，取真实测到过的那一帧，不做插值",
+  ]
+  if (stalls > 0) parts.push(`已排除 ${stalls} 次 >1 s 长停顿`)
+  void frameCount
+  return parts.join(" · ")
+}
+
+/** 性能区的口径说明（随计时可用性变化）。 */
+function perfHint(gpuAvailable: boolean): string {
+  if (!gpuAvailable) {
+    return "拿不到真实 GPU 时间（无扩展，或平台把计时器禁用了——此时查询恒为 0，加载后约 2 秒会自动判定）。GPU 实测那一行会全是 ——；帧间隔依然真实，它含提交+等待+合成。"
+  }
+  return "窗口是滑动的，面板 2 Hz 刷新。帧间隔含提交+等待+合成——但注意垂直同步会把它钉在刷新周期（16.7 / 8.3 ms），所以「稳不稳」主要看 GPU 实测那一行的平均值与 p99 差距。GPU 实测由 EXT_disjoint_timer_query_webgl2 量出（命令流首尾插时间戳，结果滞后几帧读，同步读会反拖 GPU）。"
+}
+
 /** 背景色预设。 */
 const BACKGROUND_PRESETS: { label: string; value: string }[] = [
   { label: "深空", value: "#0a0b10" },
   { label: "中灰", value: "#808080" },
   { label: "纯白", value: "#ffffff" },
   { label: "纯黑", value: "#000000" },
+]
+
+/** 渲染管线选项。 */
+const PIPELINE_OPTIONS = [
+  { value: "linear16f" as const, label: "线性 16F" },
+  { value: "direct" as const, label: "直接 sRGB" },
 ]
 
 /** 分辨率倍数选项。 */
@@ -113,6 +160,9 @@ export function InfoPanel() {
     minPx: minPx.useValue(),
     maxPx: maxPx.useValue(),
     aaMinPx: aaMinPx.useValue(),
+    statsWindow: statsWindowMs.useValue(),
+    pipeline: pipeline.useValue(),
+    floatRTUnavailable: floatRTUnavailable.useValue(),
     resolutionScale: resolutionScale.useValue(),
     background: background.useValue(),
     overlayMode: overlayMode.useValue(),
@@ -370,7 +420,22 @@ export function InfoPanel() {
 
         <div className="hairline" />
 
-        <Section title="渲染参数">
+        <Section
+          title="渲染参数"
+          hint="「直接 sRGB」省掉后处理 pass、把混合读写从 16 B/片元降到 8 B/片元，但混合发生在 sRGB 空间，重叠处不再与 SHARP 的线性结果逐像素一致。切一下看 GPU 耗时的变化。"
+        >
+          <Row label="渲染管线">
+            <div className="w-[168px]">
+              <Segmented
+                value={v.pipeline}
+                onChange={(x) => {
+                  pipeline.value = x
+                }}
+                options={PIPELINE_OPTIONS}
+                disabled={v.floatRTUnavailable}
+              />
+            </div>
+          </Row>
           <Slider
             label="高斯尺度"
             value={v.splatScale}
@@ -515,16 +580,71 @@ export function InfoPanel() {
 
         <div className="hairline" />
 
-        <Section title="性能">
+        <Section
+          title="性能"
+          right={
+            // 必须给显式宽度：Segmented 的按钮是 `flex-1`（flex-basis: 0），
+            // 放在自动宽度的容器里时，它的固有宽度会按 min-content 算
+            // （短标签 = 一两个字符），于是三个按钮被挤成很窄一条。
+            // 与面板里其他 Segmented 一样用固定宽度包裹。
+            <div className="w-[140px] shrink-0">
+              <Segmented
+                value={v.statsWindow}
+                onChange={(x) => {
+                  statsWindowMs.value = x
+                }}
+                options={STATS_WINDOWS}
+              />
+            </div>
+          }
+          hint={perfHint(v.stats.gpuTimingAvailable)}
+        >
           <div className="grid grid-cols-2 gap-2">
             <Stat
-              label="GPU 耗时"
-              value={v.stats.gpuMs >= 0 ? fmtNum(v.stats.gpuMs, 2) : "—"}
-              unit={v.stats.gpuMs >= 0 ? "ms" : undefined}
+              label="GPU 耗时（平均）"
+              value={v.stats.gpu.count > 0 ? fmtNum(v.stats.gpu.avg, 2) : "—"}
+              unit={v.stats.gpu.count > 0 ? "ms" : undefined}
               accent
             />
-            <Stat label="FPS" value={fmtNum(v.stats.fps, 0)} />
-            <Stat label="CPU 提交" value={fmtNum(v.stats.cpuMs, 2)} unit="ms" />
+            <Stat
+              label="平均帧率"
+              value={v.stats.frame.count > 0 ? fmtNum(v.stats.fps, 1) : "—"}
+              unit={v.stats.frame.count > 0 ? "fps" : undefined}
+            />
+          </div>
+          <PercentileTable
+            unit="ms"
+            columns={PERF_COLUMNS}
+            rows={[
+              {
+                label: "帧间隔",
+                values: distRow(v.stats.frame),
+                accent: true,
+              },
+              { label: "CPU 提交", values: distRow(v.stats.cpu) },
+              {
+                label: "GPU 实测",
+                values:
+                  v.stats.gpu.count > 0
+                    ? distRow(v.stats.gpu)
+                    : distRow(v.stats.gpu),
+              },
+            ]}
+          />
+          <Row
+            label="样本数"
+            value={`${v.stats.frame.count} 帧 / ${v.stats.windowMs / 1000} s 窗口`}
+            sub={sampleSub(
+              v.stats.frame.count,
+              v.stats.gpu.count,
+              v.stats.stalls,
+            )}
+          />
+          <div className="grid grid-cols-2 gap-2">
+            <Stat
+              label="管线"
+              value={v.pipeline === "direct" ? "直接 sRGB" : "线性 16F"}
+            />
             <Stat label="Draw calls" value={String(v.stats.drawCalls)} />
           </div>
           <Row
@@ -536,11 +656,6 @@ export function InfoPanel() {
             value={fmtInt(v.stats.splats)}
             sub="固定顺序 · 单次实例化绘制"
           />
-          <p className="text-[11px] leading-relaxed text-white/35">
-            {v.stats.gpuTimingAvailable
-              ? "GPU 耗时由 EXT_disjoint_timer_query_webgl2 实测：在命令流首尾插时间戳，涵盖全部 pass；结果滞后几帧读取（同步读会等 GPU，反而拖慢）。"
-              : "拿不到真实 GPU 时间（无扩展，或平台把计时器禁用了——此时查询恒为 0，加载后约 2 秒会自动判定）。上面只显示 CPU 提交耗时，它不含 GPU 执行时间。"}
-          </p>
         </Section>
 
         <div className="hairline" />

@@ -17,10 +17,22 @@
  *   但刻意把 J/W 显式写出来，避免行/列主序的隐式陷阱。
  */
 
+/**
+ * 线性 -> sRGB 编码（GLSL 无法跨阶段共享函数，只能各自定义一份）。
+ * 后处理 pass 里有一份同样的（见 POST_FS），两边改一个就要改另一个。
+ */
+const SRGB_ENCODE_GLSL = `
+vec3 linearToSrgb(vec3 c) {
+  vec3 lo = c * 12.92;
+  vec3 hi = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+  return mix(hi, lo, step(c, vec3(0.0031308)));
+}
+`
+
 /** 顶点着色器：实例化四边形（4 顶点/高斯，`a_corner` 为 ±1）。 */
 export const SPLAT_VS = /* glsl */ `#version 300 es
 precision highp float;
-
+${SRGB_ENCODE_GLSL}
 // 每顶点（divisor=0）：四边形的四个角
 layout(location = 0) in vec2 a_corner;
 // 每实例（divisor=1）：打包后的高斯属性
@@ -42,6 +54,8 @@ uniform float u_aaMinVar;     // 亚像素抗锯齿：特征值下限（像素²
 uniform float u_minPx;        // 半轴短于该值直接丢弃（像素）
 uniform float u_maxPx;        // 半轴上限（像素，防单颗铺满屏）
 uniform float u_alphaClip;    // 1/255
+uniform float u_exposure;     // 仅在「直接写画布」管线里用到
+uniform float u_encodeSrgb;   // 1 = 顶点阶段就编码成 sRGB（单 pass 管线）
 
 out vec3 v_color;
 out float v_alpha;      // 已乘 u_opacityMul，未含空间衰减
@@ -70,11 +84,21 @@ void main() {
 
   float alpha = (1.0 / (1.0 + exp(-a_opacityLogit))) * u_opacityMul;
   v_alpha = min(alpha, 0.99);
+  // 默认输出**线性**颜色，由后处理 pass 统一编码回 sRGB。
   v_color = a_color;
 
   if (z <= u_near || v_alpha <= u_alphaClip) {
     cullSplat();
     return;
+  }
+
+  // 走单 pass 管线（直接把高斯混进画布这块 RGBA8 的 sRGB 缓冲）时，
+  // 曝光与 sRGB 编码在**顶点阶段**做掉：每实例一次，比放到片元里
+  // 便宜一个数量级（实测片元数是屏像素的 20 倍，见 temp/overdraw-bench.ts）。
+  // 代价是硬件混合发生在 sRGB 空间，不再与 SHARP 的线性混合逐像素一致。
+  // 放在剔除之后：被剔掉的实例不必为 3 次 pow 付费。
+  if (u_encodeSrgb > 0.5) {
+    v_color = linearToSrgb(v_color * u_exposure);
   }
 
   // --- 3D 协方差 Σ = R·S·Sᵀ·Rᵀ ---

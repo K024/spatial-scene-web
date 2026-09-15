@@ -12,6 +12,9 @@
  *   post pass    -> 曝光 + 线性->sRGB，贴到画布
  *   overlay pass -> 参考照片按参考内参投影成「无限远背景板」，叠加/闪烁比对
  *
+ * `direct` 管线（面板可切）则只有 splat + overlay 两个 pass：splat 直接混进
+ * 画布，sRGB 编码在**顶点阶段**做（见 SPLAT_VS 的 u_encodeSrgb）。
+ *
  * ── 为什么中间要一张浮点 RT ──
  * PLY 里是 sRGB 域的 SH 系数，公开渲染器把 sRGB 当线性直接混合（重叠处偏暗）。
  * 这里先转回线性、在线性空间做预乘混合，最后统一编码回 sRGB——与 SHARP
@@ -37,6 +40,19 @@ import { SPLAT_LAYOUT, SPLAT_STRIDE } from "./types.ts"
 /** 参考图比对模式。 */
 export type OverlayMode = "off" | "overlay" | "blink"
 
+/**
+ * 渲染管线。
+ *
+ * - `linear16f`（默认）：splat -> RGBA16F 线性空间预乘混合 -> 后处理编码回
+ *   sRGB。与 SHARP 自己的渲染器语义一致（重叠处更接近物理正确）。
+ * - `direct`：splat 直接混进画布（RGBA8、sRGB 空间），没有后处理 pass。
+ *   省掉一次全屏读写，且混合读写从 16 B/片元降到 8 B/片元——实测本项目
+ *   片元数是屏像素的 20 倍（temp/overdraw-bench.ts），所以这一层往往是
+ *   真正的瓶颈。代价：sRGB 空间混合（重叠处偏亮/偏平），且 8 bit 累积在
+ *   暗部有精度损失。
+ */
+export type PipelineMode = "linear16f" | "direct"
+
 /** 每帧渲染参数（由 store 提供，渲染器只读）。 */
 export interface RenderParams {
   camera: CameraState
@@ -58,6 +74,8 @@ export interface RenderParams {
   maxPx: number
   /** 画布像素倍率（已含 devicePixelRatio 与用户的分辨率倍数）。 */
   pixelRatio: number
+  /** 渲染管线（见 {@link PipelineMode}）。 */
+  pipeline: PipelineMode
   overlayMode: OverlayMode
   /** 叠加透明度（overlay 模式）。 */
   overlayOpacity: number
@@ -65,9 +83,8 @@ export interface RenderParams {
   overlayPhase: number
 }
 
-/** 每帧统计。 */
+/** 每帧统计（**瞬时值**；分布/分位数由 `store/viewer.ts` 在滑动窗口里统计）。 */
 export interface FrameStats {
-  fps: number
   /**
    * CPU **提交**耗时（ms）：JS 里测 `render()` 自身花了多久。
    *
@@ -76,10 +93,13 @@ export interface FrameStats {
    */
   cpuMs: number
   /**
-   * GPU **实测**耗时（ms）：由 `EXT_disjoint_timer_query_webgl2` 量出，
-   * 含全部 pass（splat + 后处理 + 叠加）。不可用时为 `-1`。
+   * 本帧**新取到**的 GPU 实测耗时（ms）。
+   *
+   * `null` = 本帧没有新样本（计时查询还积压在 GPU 队列里，或结果被丢弃）。
+   * 必须区分「没有新样本」与「有样本」：早期版本用 EMA 平滑后每帧都返回一个值，
+   * 同一个样本会被反复计入分布，分位数就失真了。
    */
-  gpuMs: number
+  gpuMs: number | null
   /** 本帧认为硬件计时是否可用（动态判定，见 `createGpuTimer`）。 */
   gpuTimingAvailable: boolean
   width: number
@@ -99,14 +119,13 @@ export interface SplatRenderer {
   readonly camera: RenderCamera
   /** GPU 名称（判断是否踩到软件渲染）。 */
   readonly rendererInfo: string
+  /** 缺少 `EXT_color_buffer_float`：线性 16F 管线不可用，只能走 direct。 */
+  readonly floatRTUnavailable: boolean
   dispose(): void
 }
 
 /** 片元 alpha 阈值 1/255：低于此值写入也不可见，直接 discard 省带宽。 */
 const ALPHA_CLIP = 1 / 255
-
-/** 每隔多少毫秒刷新一次 fps 统计（避免 60 Hz 触发 React 重渲染）。 */
-const STATS_INTERVAL_MS = 200
 
 /** 全屏后处理三角形（注意：不是四边形，避免对角线处的重复着色）。 */
 const SCREEN_TRIANGLE = new Float32Array([-1, -1, 3, -1, -1, 3])
@@ -123,7 +142,7 @@ const CORNER_QUAD = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1])
  * @param canvas 目标画布（尺寸由 {@link RenderParams.pixelRatio} 驱动）。
  */
 export function createSplatRenderer(canvas: HTMLCanvasElement): SplatRenderer {
-  const gl = canvas.getContext("webgl2", {
+  const glCtx = canvas.getContext("webgl2", {
     alpha: false,
     antialias: false,
     depth: false,
@@ -132,11 +151,17 @@ export function createSplatRenderer(canvas: HTMLCanvasElement): SplatRenderer {
     preserveDrawingBuffer: false,
     powerPreference: "high-performance",
   })
-  if (!gl) throw new Error("无法创建 WebGL2 上下文")
+  if (!glCtx) throw new Error("无法创建 WebGL2 上下文")
+  // 显式标注（而不是靠上面的守卫推断）：下面有函数**声明**（ensureRT），
+  // 声明会被提升，tsgo 不会把 `!gl` 的收窄带进它的函数体。
+  const gl: WebGL2RenderingContext = glCtx
 
-  if (!gl.getExtension("EXT_color_buffer_float")) {
-    throw new Error(
-      "缺少 EXT_color_buffer_float：无法渲染到 RGBA16F（线性混合需要它）",
+  // 线性 16F 管线要求 RGBA16F 可被渲染（WebGL2 里这是扩展）。缺了就只提供
+  // direct 管线——不再像早期版本那样直接抛错，因为单 pass 管线本来就不需要它。
+  const floatRTUnavailable = !gl.getExtension("EXT_color_buffer_float")
+  if (floatRTUnavailable) {
+    console.warn(
+      "缺少 EXT_color_buffer_float：线性 16F 管线不可用，已退回直接写画布的 sRGB 管线",
     )
   }
   const rendererInfo = describeRenderer(gl)
@@ -186,7 +211,7 @@ export function createSplatRenderer(canvas: HTMLCanvasElement): SplatRenderer {
     wrap: gl.CLAMP_TO_EDGE,
   })
 
-  // ── 离屏 RT（线性空间）──
+  // ── 离屏 RT（线性空间，惰性创建）──
   //
   // 这里有个 twgl 的坑：`format` 同时兼作 internalFormat 与像素 format
   // （内部 `internalFormat = opt.internalFormat || opt.format`，但
@@ -203,20 +228,31 @@ export function createSplatRenderer(canvas: HTMLCanvasElement): SplatRenderer {
       wrap: gl.CLAMP_TO_EDGE,
     },
   ]
-  const rt = twgl.createFramebufferInfo(gl, rtAttachments, 1, 1)
-  let rtWidth = 1
-  let rtHeight = 1
+  // 惰性创建：一直用 direct 管线就一张都不分配（也避开缺扩展时 twgl 打警告）
+  let rt: twgl.FramebufferInfo | null = null
+  let rtWidth = 0
+  let rtHeight = 0
+  function ensureRT(w: number, h: number): twgl.FramebufferInfo {
+    if (!rt) {
+      rt = twgl.createFramebufferInfo(gl, rtAttachments, w, h)
+      rtWidth = w
+      rtHeight = h
+    } else if (w !== rtWidth || h !== rtHeight) {
+      twgl.resizeFramebufferInfo(gl, rt, rtAttachments, w, h)
+      rtWidth = w
+      rtHeight = h
+    }
+    return rt
+  }
 
   const gpuTimer = createGpuTimer(gl)
 
   const cam = new RenderCamera()
   let splatCount = 0
-  let frames = 0
-  let fps = 0
-  let lastStats = performance.now()
 
   return {
     rendererInfo,
+    floatRTUnavailable,
     camera: cam,
 
     setSplats(packed) {
@@ -237,8 +273,9 @@ export function createSplatRenderer(canvas: HTMLCanvasElement): SplatRenderer {
 
     render(params) {
       const t0 = performance.now()
-      // 先取上上帧就已完成的 GPU 计时结果（绝不同步等当前帧，否则会把 GPU 拖死）
-      const gpuMs = gpuTimer?.poll() ?? -1
+      // 先取上上帧就已完成的 GPU 计时结果（绝不同步等当前帧，否则会把 GPU 拖死）。
+      // null = 本帧没有新样本，不要计入分布。
+      const gpuMs = gpuTimer?.poll() ?? null
 
       const width = Math.max(
         1,
@@ -252,11 +289,7 @@ export function createSplatRenderer(canvas: HTMLCanvasElement): SplatRenderer {
         canvas.width = width
         canvas.height = height
       }
-      if (width !== rtWidth || height !== rtHeight) {
-        twgl.resizeFramebufferInfo(gl, rt, rtAttachments, width, height)
-        rtWidth = width
-        rtHeight = height
-      }
+      const direct = params.pipeline === "direct" || floatRTUnavailable
 
       cam.update(params.camera, width, height)
 
@@ -265,13 +298,18 @@ export function createSplatRenderer(canvas: HTMLCanvasElement): SplatRenderer {
 
       // ── 1) splat pass ──
       const bg = hexToRgb(params.background)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, rt.framebuffer)
+      // 线性管线写 RT（清屏色需要线性化，最后统一编码回 sRGB）；
+      // direct 管线写画布（画布已是 sRGB 编码的 RGBA8，直接用原色清屏）。
+      if (direct) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      } else {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, ensureRT(width, height).framebuffer)
+      }
       gl.viewport(0, 0, width, height)
-      // 背景色同样要线性化：RT 是线性空间，最后统一编码回 sRGB
       gl.clearColor(
-        srgbToLinear(bg[0]),
-        srgbToLinear(bg[1]),
-        srgbToLinear(bg[2]),
+        direct ? bg[0] : srgbToLinear(bg[0]),
+        direct ? bg[1] : srgbToLinear(bg[1]),
+        direct ? bg[2] : srgbToLinear(bg[2]),
         1,
       )
       gl.clear(gl.COLOR_BUFFER_BIT)
@@ -297,26 +335,31 @@ export function createSplatRenderer(canvas: HTMLCanvasElement): SplatRenderer {
           u_minPx: params.minPx,
           u_maxPx: params.maxPx,
           u_alphaClip: ALPHA_CLIP,
+          u_exposure: params.exposure,
+          // direct：片元输出已是 sRGB，混合直接发生在画布上
+          u_encodeSrgb: direct ? 1 : 0,
         })
         // 4 顶点/实例 × N 实例；顺序 = 顶点缓冲顺序 = 远到近
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, splatCount)
         drawCalls++
       }
 
-      // ── 2) post pass：线性 -> sRGB，贴到画布 ──
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
-      gl.viewport(0, 0, width, height)
-      gl.disable(gl.BLEND)
-      // biome-ignore lint/correctness/useHookAtTopLevel: gl.useProgram 是 WebGL 调用，不是 React Hook（规则按 use[A-Z] 前缀误判）
-      gl.useProgram(postProgram.program)
-      twgl.setBuffersAndAttributes(gl, postProgram, screenInfo)
-      twgl.setUniforms(postProgram, {
-        u_hdr: rt.attachments[0],
-        u_exposure: params.exposure,
-        u_encodeSrgb: 1,
-      })
-      twgl.drawBufferInfo(gl, screenInfo, gl.TRIANGLES)
-      drawCalls++
+      // ── 2) post pass：线性 -> sRGB，贴到画布（direct 管线没有这一步）──
+      if (!direct && rt) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+        gl.viewport(0, 0, width, height)
+        gl.disable(gl.BLEND)
+        // biome-ignore lint/correctness/useHookAtTopLevel: gl.useProgram 是 WebGL 调用，不是 React Hook（规则按 use[A-Z] 前缀误判）
+        gl.useProgram(postProgram.program)
+        twgl.setBuffersAndAttributes(gl, postProgram, screenInfo)
+        twgl.setUniforms(postProgram, {
+          u_hdr: rt.attachments[0],
+          u_exposure: params.exposure,
+          u_encodeSrgb: 1,
+        })
+        twgl.drawBufferInfo(gl, screenInfo, gl.TRIANGLES)
+        drawCalls++
+      }
 
       // ── 3) overlay pass：参考图比对 ──
       if (params.overlayMode !== "off" && splatCount > 0) {
@@ -342,20 +385,16 @@ export function createSplatRenderer(canvas: HTMLCanvasElement): SplatRenderer {
         drawCalls++
       }
 
-      // ── 统计（fps 用固定窗口平均，避免抖动）──
+      // ── 统计 ──
+      // 这里只收**瞬时**值：帧间隔/分布/分位数全部由 store 在滑动窗口里统计。
+      // 早期版本在这里做 EMA + 固定窗口 fps，两者口径不同又都在面板上出现，
+      // 既看不出波动也看不出尾部，已经搬到 store/viewer.ts。
       gpuTimer?.end()
-      frames++
       const now = performance.now()
-      if (now - lastStats >= STATS_INTERVAL_MS) {
-        fps = (frames * 1000) / (now - lastStats)
-        frames = 0
-        lastStats = now
-      }
 
       return {
-        fps,
         cpuMs: now - t0,
-        gpuMs,
+        gpuMs: gpuMs,
         gpuTimingAvailable: gpuTimer?.available ?? false,
         width,
         height,
@@ -371,8 +410,10 @@ export function createSplatRenderer(canvas: HTMLCanvasElement): SplatRenderer {
       gl.deleteBuffer(attrib(screenInfo, "a_pos").buffer)
       gl.deleteBuffer(attrib(overlayInfo, "a_uv").buffer)
       gl.deleteTexture(refTexture)
-      gl.deleteFramebuffer(rt.framebuffer)
-      gl.deleteTexture(rt.attachments[0] as WebGLTexture)
+      if (rt) {
+        gl.deleteFramebuffer(rt.framebuffer)
+        gl.deleteTexture(rt.attachments[0] as WebGLTexture)
+      }
       gl.deleteProgram(splatProgram.program)
       gl.deleteProgram(postProgram.program)
       gl.deleteProgram(overlayProgram.program)
@@ -411,8 +452,6 @@ function createGpuTimer(gl: WebGL2RenderingContext): GpuTimer | null {
   /** 已结束、等 GPU 写完的查询。 */
   const pending: WebGLQuery[] = []
   let active: WebGLQuery | null = null
-  /** 指数滑动平均后的 GPU 耗时（ms）；-1 = 还没有有效值。 */
-  let emaMs = -1
   /** 拿到过至少一个有效结果。 */
   let sawResult = false
   /** 已经过去多少帧仍未拿到有效结果（用于「放弃」判定）。 */
@@ -446,23 +485,29 @@ function createGpuTimer(gl: WebGL2RenderingContext): GpuTimer | null {
       }
     },
 
+    /**
+     * 取**一个已完成查询**的耗时（ms）。
+     *
+     * 只有在真的消费掉一个结果时才返回数值；否则返回 `null`。
+     * 这一点很关键：每次 `drawArraysInstanced` 后 GPU 耗时不会马上可读，
+     * 若把「上次的结果」每帧都返回一次，同一个样本会被重复统计，
+     * 分位数就变成了加权平均（而且偏向恰好被重复最多的那个值）。
+     */
     poll() {
       const q = pending[0]
-      if (!q) return emaMs
-      if (!gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) return emaMs
+      if (!q) return null
+      if (!gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) return null
 
       pending.shift()
       const disjoint = Boolean(gl.getParameter(ext.GPU_DISJOINT_EXT))
-      // 先取值再归还：结果无效时当帧丢弃，不污染平均值
+      // 先取值再归还：结果无效时当帧丢弃，不污染统计
       const ns = disjoint ? 0 : Number(gl.getQueryParameter(q, gl.QUERY_RESULT))
       free.push(q)
-      if (disjoint || !Number.isFinite(ns) || ns <= 0) return emaMs
+      if (disjoint || !Number.isFinite(ns) || ns <= 0) return null
 
-      const ms = ns / 1e6
       sawResult = true
       blindFrames = 0
-      emaMs = emaMs < 0 ? ms : emaMs * (1 - GPU_EMA_ALPHA) + ms * GPU_EMA_ALPHA
-      return emaMs
+      return ns / 1e6
     },
 
     dispose() {
@@ -488,16 +533,13 @@ interface GpuTimer {
   readonly available: boolean
   begin(): void
   end(): void
-  /** 取最近一个已完成帧的 GPU 耗时（ms）；无有效值时返回 -1。 */
-  poll(): number
+  /** 取一个已完成查询的 GPU 耗时（ms）；本帧没有新样本时返回 `null`。 */
+  poll(): number | null
   dispose(): void
 }
 
 /** GPU 耗时最多的等待帧数：超过就丢弃，避免查询对象堆积。 */
 const MAX_PENDING_QUERIES = 4
-
-/** GPU 耗时的滑动平均系数（0.2 约等于「近 5 帧平均」）。 */
-const GPU_EMA_ALPHA = 0.2
 
 /** 约 2 秒（60 fps）都没拿到过有效结果，就认为该平台计时器被禁用。 */
 const TIMER_GIVE_UP_FRAMES = 120

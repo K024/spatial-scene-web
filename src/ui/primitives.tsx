@@ -6,7 +6,7 @@
  * 也让 React Compiler 的依赖分析保持在调用方一处。
  */
 
-import type { ReactNode } from "react"
+import { Fragment, type ReactNode } from "react"
 
 /** 面板分组标题 + 内容。 */
 export function Section({
@@ -191,7 +191,9 @@ export function Segmented<T extends string | number>({
 }) {
   return (
     <div
-      className={`flex gap-0.5 rounded-lg border border-white/10 bg-white/4 p-0.5 ${
+      // shrink-0：按钮是 `flex-1`（flex-basis: 0），一旦被上层压窄，
+      // 标签就会被挤到溢出；宁可整个控件不缩，由调用方给足宽度。
+      className={`flex shrink-0 gap-0.5 rounded-lg border border-white/10 bg-white/4 p-0.5 ${
         disabled ? "pointer-events-none opacity-40" : ""
       }`}
     >
@@ -200,7 +202,7 @@ export function Segmented<T extends string | number>({
           key={String(o.value)}
           type="button"
           onClick={() => onChange(o.value)}
-          className={`focus-ring flex-1 rounded-[6px] px-2 py-1 text-[11.5px] transition-colors duration-150 ${
+          className={`focus-ring flex-1 rounded-[6px] px-2 py-1 text-[11.5px] whitespace-nowrap transition-colors duration-150 ${
             o.value === value
               ? "bg-white/12 text-white shadow-sm"
               : "text-white/55 hover:bg-white/6 hover:text-white/80"
@@ -297,5 +299,57 @@ export function Badge({
       <span className={`h-1.5 w-1.5 rounded-full ${dot}`} />
       {children}
     </span>
+  )
+}
+
+/**
+ * 分位数表格：`行 × { 平均 / p95 / p99 / 最大 }`。
+ *
+ * 专门为性能面板做的：单列数字看不出「稳不稳」，四列并排才能一眼看出
+ * 平均值与尾部的差距（差得越多说明抖动越大）。
+ * 数值列用等宽数字 + 右对齐，刷新时不会左右跳。
+ */
+export function PercentileTable({
+  columns,
+  rows,
+  unit,
+}: {
+  columns: string[]
+  rows: { label: string; values: (string | null)[]; accent?: boolean }[]
+  unit: string
+}) {
+  return (
+    <div className="rounded-lg border border-white/[0.07] bg-white/[0.02] px-2.5 py-2">
+      <div
+        className="grid items-baseline gap-x-2 gap-y-1 text-[11px]"
+        style={{ gridTemplateColumns: `auto repeat(${columns.length}, 1fr)` }}
+      >
+        <span className="text-[10px] tracking-wide text-white/30">{unit}</span>
+        {columns.map((c) => (
+          <span key={c} className="text-right text-[10px] text-white/30">
+            {c}
+          </span>
+        ))}
+        {rows.map((r) => (
+          <Fragment key={r.label}>
+            <span className="text-white/45">{r.label}</span>
+            {r.values.map((v, i) => (
+              <span
+                key={i}
+                className={`text-right tabular-nums ${
+                  v === null
+                    ? "text-white/20"
+                    : r.accent
+                      ? "text-accent-300"
+                      : "text-white/85"
+                }`}
+              >
+                {v ?? "—"}
+              </span>
+            ))}
+          </Fragment>
+        ))}
+      </div>
+    </div>
   )
 }
