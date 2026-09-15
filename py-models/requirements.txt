@@ -1,0 +1,15 @@
+torch
+torchvision
+numpy
+onnx
+onnxruntime
+ml_dtypes
+packaging
+timm
+plyfile
+scipy
+imageio
+imageio-ffmpeg
+pillow-heif
+pillow
+matplotlib
