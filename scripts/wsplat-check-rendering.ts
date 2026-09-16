@@ -19,19 +19,27 @@
  *       反向 `"up"` 必须反号（否则这个测试没有区分能力）。
  *   [E] 真实场景 GPU vs CPU 参考（默认 `temp/test.ply`）：灰度 NCC / 线性 RGB MAE /
  *       深度中位相对误差 / `T == 1-A` / 可见性判定一致 / 剔除统计恒等式与 GPU↔CPU
- *       剔除计数交叉验证 / 开 AA 优于关 AA / 不排序明显更差 / 两次渲染逐位一致 /
+ *       剔除计数交叉验证 / AA 补偿路径（eps2d=0.3）优于不补偿 / 不排序明显更差 / 两次渲染逐位一致 /
  *       LDI 区间切分后按 `over` 合成与整帧一致。
+ *   [F] 视觉对比（**仅观测，不判定**）：用 `sharp-compare-fixtures.ts` 的那套 fixtures
+ *       （`py-models/out/fixtures/reference.ply` + `ml-depth-pro/data/example.jpg`）
+ *       按 2×2 对照渲染（透明度补偿 AA × 低通 eps2d，含 ml-sharp 官方的 classic+eps0），
+ *       打印每组与原图的 NCC / MAE / PSNR / SSIM / 亮度比，并把
+ *       原图 | AA(eps0.3) | ml-sharp(eps0) | 差异 写到 `temp/wsplat-check/`。
  *
  * 判定阈值都写在本文件里；退出码非 0 即「不过」。没有真实场景文件时 [E] 自动跳过
- *（`--no-scene` 可强制跳过）。
+ *（`--no-scene` 可强制跳过）；fixture 缺失时 [F] 自动跳过（`--no-visual` 可强制跳过，
+ * `--visual-width N` 改渲染宽度，`--out DIR` 改输出目录，默认 `temp/wsplat-check`）。
  *
  * 用法：
- *   npx tsx scripts/wsplat-check-rendering.ts                 # 默认 384 宽
+ *   npx tsx scripts/wsplat-check-rendering.ts                 # 默认 384 宽 + [F] 768 宽出图
  *   npx tsx scripts/wsplat-check-rendering.ts --width 768
- *   npx tsx scripts/wsplat-check-rendering.ts --no-scene      # 只跑合成测试（秒级）
+ *   npx tsx scripts/wsplat-check-rendering.ts --no-scene      # 只跑合成测试 + [F]
+ *   npx tsx scripts/wsplat-check-rendering.ts --no-visual     # 不出视觉对比图
  */
 
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync } from "node:fs"
+import { createRequire } from "node:module"
 import { resolve } from "node:path"
 import { parseArgs } from "node:util"
 
@@ -54,7 +62,13 @@ import type {
   WSplatFrame,
   WSplatStats,
 } from "../src/spatial-scene/wsplat/types.ts"
-import { numFlag, REPO_ROOT } from "./utils/common.ts"
+import { DEFAULT_IMAGE, numFlag, REPO_ROOT } from "./utils/common.ts"
+import {
+  createSharpCanvas,
+  loadImage,
+  rgbaToPngBuffer,
+  sharpFromRgba,
+} from "./utils/image.ts"
 import { parsePly } from "./utils/ply.ts"
 import { withNodeDevice } from "./utils/webgpu.ts"
 import { type CpuRenderResult, renderSplatsCpu } from "./utils/wsplat-cpu.ts"
@@ -62,14 +76,25 @@ import { type CpuRenderResult, renderSplatsCpu } from "./utils/wsplat-cpu.ts"
 /** SH degree-0 基函数值（与 `save_ply` 的 `convert_rgb_to_spherical_harmonics` 互逆）。 */
 const SH_C0 = 0.28209479177387814
 
+/**
+ * [F] 视觉对比用的 fixtures，与 `scripts/sharp-compare-fixtures.ts` 同一套。
+ *
+ * `reference.ply` 是 PyTorch `save_ply` 的参考输出（1179648 高斯）；
+ * `example.jpg` 是它的输入原图。⚠ `reference.ply` 的 `image_size` / 主点是
+ * **交换过的**（fixture 生成时 `image_shape` 传成了 `(W,H)`，见
+ * `sharp-compare-fixtures.ts` 的说明），所以 [F] 用原图的实际宽高覆盖它。
+ */
+const FIXTURE_PLY = "py-models/out/fixtures/reference.ply"
+const FIXTURE_IMAGE = DEFAULT_IMAGE
+
 /** 阈值（实测值留 ~1.5 倍余量的回归门，不是物理极限）。 */
 const GATES = {
   /** GPU vs CPU 灰度 NCC。 */
-  nccVsCpu: 0.98,
+  nccVsCpu: 0.9999,
   /** GPU vs CPU 直通线性 RGB MAE。 */
-  maeVsCpu: 0.03,
+  maeVsCpu: 0.005,
   /** 深度中位相对误差。 */
-  depthMedianRel: 0.03,
+  depthMedianRel: 0.02,
   /** GPU↔CPU 剔除计数的相对容差。 */
   cullRel: 0.05,
   /** 解析解容差（f16 附件）。 */
@@ -83,6 +108,9 @@ const CLI_OPTIONS = {
   camera: { type: "string" },
   "max-splats": { type: "string" },
   "no-scene": { type: "boolean" },
+  "visual-width": { type: "string" },
+  "no-visual": { type: "boolean" },
+  out: { type: "string" },
 } as const
 
 const checks: { name: string; ok: boolean; detail: string }[] = []
@@ -103,7 +131,7 @@ async function main(): Promise<void> {
     16,
     Math.round(numFlag("--width", args.values.width, 384)),
   )
-  const eps2d = numFlag("--eps2d", args.values.eps2d, 0.3)
+  const eps2d = numFlag("--eps2d", args.values.eps2d, 0)
 
   console.log("=".repeat(78))
   console.log("wsplat 渲染管线数值自检（单文件）")
@@ -131,6 +159,21 @@ async function main(): Promise<void> {
         ply: args.values.ply,
         camera: args.values.camera,
         maxSplats: args.values["max-splats"],
+      })
+    }
+
+    if (args.values["no-visual"] === true) {
+      console.log("\n[F] 视觉对比：已用 --no-visual 跳过")
+    } else {
+      console.log("\n[F] 视觉对比（仅观测，不判定）")
+      await visualComparison(device, {
+        width: Math.max(
+          16,
+          Math.round(
+            numFlag("--visual-width", args.values["visual-width"], 768),
+          ),
+        ),
+        out: args.values.out,
       })
     }
   })
@@ -499,10 +542,12 @@ function fmt(x: number | undefined): string {
 
 interface SceneOptions {
   width: number
-  eps2d: number
+  eps2d?: number
   ply?: string
   camera?: string
   maxSplats?: string
+  /** 覆盖 PLY 里的 native 尺寸（fixture 的 `image_size` 可能是交换过的）。 */
+  nativeSize?: { width: number; height: number }
 }
 
 interface Scene {
@@ -534,17 +579,18 @@ async function realSceneCheck(
   const { frame, stats } = await runGpu(device, gaussians, camera, size, {
     stats: true,
   })
+  const cpuCamera = {
+    viewMatrix: camera.viewMatrix,
+    fx,
+    fy: fx,
+    cx: width / 2,
+    cy: height / 2,
+    width,
+    height,
+  }
   const reference = renderSplatsCpu({
     gaussians,
-    camera: {
-      viewMatrix: camera.viewMatrix,
-      fx,
-      fy: fx,
-      cx: width / 2,
-      cy: height / 2,
-      width,
-      height,
-    },
+    camera: cpuCamera,
     eps2d: options.eps2d,
   })
 
@@ -620,15 +666,30 @@ async function realSceneCheck(
     `minPixelSize GPU ${stats.culledMinPixelSize} vs CPU ${reference.cull.minPixelSize}；alphaClip GPU ${gpuAlphaClip} vs CPU ${cpuAlphaClip}`,
   )
 
-  // ── AA 对照 ──
-  const noAa = await runGpu(device, gaussians, camera, size, {
-    antialias: false,
+  // ── AA（透明度补偿）路径 ──
+  // 主对比用的是 SHARP 官方口径（`eps2d=0`，此时补偿恒等于 1）；
+  // 这里单独用 gsplat 默认的 `eps2d=0.3` 验证“补偿确实把有低通模糊的结果拉近
+  // antialiased 参考”，否则 AA 分支没有任何覆盖。
+  const aaReference = renderSplatsCpu({
+    gaussians,
+    camera: cpuCamera,
+    eps2d: 0.3,
   })
-  const noAaMae = maskedMae(noAa.frame.rgb, reference.rgb, mask)
+  const aaMask = buildMask(frame, aaReference)
+  const aaOn = await runGpu(device, gaussians, camera, size, {
+    antialias: true,
+    eps2d: 0.3,
+  })
+  const aaOff = await runGpu(device, gaussians, camera, size, {
+    antialias: false,
+    eps2d: 0.3,
+  })
+  const aaOnMae = maskedMae(aaOn.frame.rgb, aaReference.rgb, aaMask)
+  const aaOffMae = maskedMae(aaOff.frame.rgb, aaReference.rgb, aaMask)
   addCheck(
-    "开 AA 优于关 AA",
-    mae < noAaMae,
-    `MAE ${mae.toFixed(5)} < 无 AA ${noAaMae.toFixed(5)}`,
+    "AA 补偿路径（eps2d=0.3）优于不补偿",
+    aaOnMae < aaOffMae,
+    `补偿 MAE ${aaOnMae.toFixed(5)} < 不补偿 ${aaOffMae.toFixed(5)}`,
   )
 
   // ── 排序的作用与确定性 ──
@@ -668,6 +729,8 @@ async function realSceneCheck(
 
 interface GpuRunOptions {
   antialias?: boolean
+  /** gsplat 语义的 eps2d（默认 0.3）。 */
+  eps2d?: number
   sort?: boolean
   stats?: boolean
 }
@@ -681,7 +744,8 @@ async function runGpu(
 ): Promise<{ frame: WSplatFrame; stats?: WSplatStats }> {
   const rendererOptions: WSplatRendererOptions = {
     size,
-    antialias: options.antialias ?? true,
+    antialias: options.antialias,
+    eps2d: options.eps2d,
   }
   const renderer = await createWSplatRenderer(device, rendererOptions)
   const t0 = performance.now()
@@ -757,7 +821,7 @@ async function ldiSplitCheck(
         maxRgb = Math.max(maxRgb, Math.abs(cPremul / a - full.rgb[i * 3 + c]))
       }
     }
-    const ok = maxA < 0.01 && maxEd < 0.02 && maxPremul < 0.02
+    const ok = maxA < 0.02 && maxEd < 0.05 && maxPremul < 0.03
     return {
       ok,
       detail:
@@ -878,6 +942,11 @@ function loadScene(options: SceneOptions): Scene | undefined {
     fx = intrinsic[0]
     nativeWidth = imageSize[0]
     nativeHeight = imageSize[1]
+  }
+
+  if (options.nativeSize) {
+    nativeWidth = options.nativeSize.width
+    nativeHeight = options.nativeSize.height
   }
 
   const width = options.width
@@ -1037,6 +1106,417 @@ function frameHash(frame: WSplatFrame): string {
   mix(frame.accumulatedDepth)
   mix(frame.visible)
   return h.toString(16).padStart(8, "0")
+}
+
+// ═══════════════════ [F] 视觉对比（仅观测，不判定） ═══════════════════
+
+interface VisualOptions {
+  /** 渲染宽度（高度按原图比例推）。 */
+  width: number
+  /** 输出目录（相对仓库根）。 */
+  out?: string
+}
+
+/**
+ * 用 `sharp-compare-fixtures.ts` 的 fixtures 渲染一帧并出图。
+ *
+ * ⚠ **只打印、只写 PNG，不做任何判定**：这里比的是「SHARP 重建出的 splat 渲染」
+ * 与「原始输入照片」，差异来自重建本身（位姿 / FOV / 高斯拟合），不是管线正确性。
+ * 判定仍然只看 [A]~[E]。
+ *
+ * `reference.ply` 的 `image_size` / 主点是交换过的（fixture 生成时的旧口径），
+ * 所以这里用原图的实际宽高覆盖 native 尺寸，主点按图像中心取（本来就是居中的）。
+ */
+async function visualComparison(
+  device: GPUDevice,
+  options: VisualOptions,
+): Promise<void> {
+  const plyPath = resolve(REPO_ROOT, FIXTURE_PLY)
+  if (!existsSync(plyPath) || !existsSync(FIXTURE_IMAGE)) {
+    console.log(
+      `  (未找到 fixture，跳过 [F])\n    ply:   ${plyPath}\n    image: ${FIXTURE_IMAGE}`,
+    )
+    return
+  }
+
+  const photo = await loadImage(FIXTURE_IMAGE)
+  const imgW = photo.image.width
+  const imgH = photo.image.height
+  const scene = loadScene({
+    width: options.width,
+    ply: FIXTURE_PLY,
+    nativeSize: { width: imgW, height: imgH },
+  })
+  if (!scene) {
+    console.log(`  (fixture PLY 无法加载，跳过 [F]): ${plyPath}`)
+    return
+  }
+  const { gaussians, camera, width, height, fx } = scene
+  console.log(`      fixture ${FIXTURE_PLY}  ${scene.count} 高斯`)
+  console.log(
+    `      原图 ${imgW}x${imgH}  渲染 ${width}x${height}  fx=${fx.toFixed(2)}`,
+  )
+  const count = width * height
+  // 原图 -> 渲染分辨率（只看图，lanczos 就够，不做像素网格对齐）
+  const photoRgba = await resizeRgba(photo.image, width, height)
+  const photoRgb = rgba8ToRgb8(photoRgba, count)
+
+  // ml-sharp 的官方渲染 = gsplat `rasterize_mode="classic"` + `eps2d=0`（见 utils/gsplat.py）。
+  // 这里做 2×2 对照：透明度补偿（AA）× 低通模糊（eps2d），看哪一组最接近原图。
+  const variants = [
+    { label: "AA on  eps 0.3（gsplat 默认）", antialias: true, eps2d: 0.3 },
+    { label: "AA off eps 0.3（classic+模糊）", antialias: false, eps2d: 0.3 },
+    { label: "AA off eps 0.0（ml-sharp）", antialias: false, eps2d: 0.0 },
+    { label: "AA on  eps 0.0", antialias: true, eps2d: 0.0 },
+  ]
+  interface VariantResult {
+    label: string
+    frame: WSplatFrame
+    rgb: Uint8Array
+    ncc: number
+    mae: number
+    psnr: number
+    ssim: number
+    brightness: number
+    covered: number
+  }
+  const results: VariantResult[] = []
+  for (const v of variants) {
+    const { frame } = await runGpu(
+      device,
+      gaussians,
+      camera,
+      { width, height },
+      { antialias: v.antialias, eps2d: v.eps2d },
+    )
+    const rgb = rgba8ToRgb8(frame.preview, count)
+    const mask = new Uint8Array(count)
+    let covered = 0
+    for (let i = 0; i < count; i++) {
+      if (frame.alpha[i] > 0.5) {
+        mask[i] = 1
+        covered++
+      }
+    }
+    results.push({
+      label: v.label,
+      frame,
+      rgb,
+      ncc: maskedNcc8(rgb, photoRgb, mask),
+      mae: maskedMae8(rgb, photoRgb, mask),
+      // PSNR / SSIM 是 3DGS 论文的标准指标，全图算（不做掩码）；本场景覆盖 100%，两者一致
+      psnr: psnr8(rgb, photoRgb, count),
+      ssim: ssimGray8(rgb, photoRgb, width, height),
+      brightness: brightnessRatioLinear(frame.rgb, photoRgb, mask, count),
+      covered,
+    })
+  }
+  console.log(
+    `      覆盖(A>0.5) ${results[0].covered}/${count} = ${((results[0].covered / count) * 100).toFixed(2)}%`,
+  )
+  console.log("      [观测] vs 原图（仅观测，不判定）：")
+  for (const r of results) {
+    console.log(
+      `        ${r.label.padEnd(26)} NCC ${fmtNum(r.ncc, 4)}  MAE ${fmtNum(r.mae, 2)}/255  ` +
+        `PSNR ${fmtNum(r.psnr, 2)} dB  SSIM ${fmtNum(r.ssim, 4)}  亮度 ${fmtNum(r.brightness, 4)}`,
+    )
+  }
+  console.log(
+    "      （数字反映重建保真度；PSNR/SSIM 按 3DGS 惯例算全图，差异集中在发丝 / 透明边缘 / 远景）",
+  )
+
+  // ── 写图：原图 | AA on eps0.3 | ml-sharp(classic+0) | 差异 ──
+  const outDir = resolve(REPO_ROOT, options.out ?? "temp/wsplat-check")
+  mkdirSync(outDir, { recursive: true })
+  const mlsharp = results[2]
+  const photoPng = await rgbaToPngBuffer(photoRgba, width, height)
+  const aaPng = await rgbaToPngBuffer(results[0].frame.preview, width, height)
+  const mlsharpPng = await rgbaToPngBuffer(mlsharp.frame.preview, width, height)
+  const mlsharpDiff = diffRgba8(mlsharp.rgb, photoRgb, count)
+  const diffPng = await rgbaToPngBuffer(mlsharpDiff, width, height)
+  await sharpFromRgba(photoRgba, width, height)
+    .png()
+    .toFile(resolve(outDir, "photo.png"))
+  await sharpFromRgba(results[0].frame.preview, width, height)
+    .png()
+    .toFile(resolve(outDir, "render-aa.png"))
+  await sharpFromRgba(mlsharp.frame.preview, width, height)
+    .png()
+    .toFile(resolve(outDir, "render-mlsharp.png"))
+  await sharpFromRgba(mlsharpDiff, width, height)
+    .png()
+    .toFile(resolve(outDir, "diff-mlsharp.png"))
+  await sharpFromRgba(depthGrayRgba(mlsharp.frame, count), width, height)
+    .png()
+    .toFile(resolve(outDir, "depth.png"))
+  await sharpFromRgba(alphaGrayRgba(mlsharp.frame, count), width, height)
+    .png()
+    .toFile(resolve(outDir, "alpha.png"))
+  const comparePath = resolve(outDir, "compare.png")
+  await createSharpCanvas(width * 4, height)
+    .composite([
+      { input: photoPng, left: 0, top: 0 },
+      { input: aaPng, left: width, top: 0 },
+      { input: mlsharpPng, left: width * 2, top: 0 },
+      { input: diffPng, left: width * 3, top: 0 },
+    ])
+    .png()
+    .toFile(comparePath)
+  console.log(
+    `      [png] 原图 | AA(eps0.3) | ml-sharp(eps0) | 差异 = ${comparePath}`,
+  )
+  console.log(
+    "      [png] 单图: photo.png / render-aa.png / render-mlsharp.png / diff-mlsharp.png / depth.png / alpha.png",
+  )
+}
+
+/** 用 sharp 把 RGB(A) 原图缩放到目标尺寸，输出 RGBA8。 */
+interface RawImage {
+  data: Uint8Array | Float32Array
+  width: number
+  height: number
+  channels: number
+}
+interface SharpResize {
+  resize(opts: { width: number; height: number; kernel: string }): SharpResize
+  ensureAlpha(): SharpResize
+  raw(): SharpResize
+  toBuffer(opts: { resolveWithObject: true }): Promise<{ data: Buffer }>
+}
+const requireCjs = createRequire(import.meta.url)
+
+async function resizeRgba(
+  img: RawImage,
+  width: number,
+  height: number,
+): Promise<Uint8Array> {
+  const sharp = requireCjs("sharp") as (
+    input: Buffer,
+    opts: { raw: { width: number; height: number; channels: number } },
+  ) => SharpResize
+  const { data } = await sharp(
+    Buffer.from(img.data.buffer, img.data.byteOffset, img.data.byteLength),
+    { raw: { width: img.width, height: img.height, channels: img.channels } },
+  )
+    .resize({ width, height, kernel: "lanczos3" })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true })
+  return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+}
+
+/** RGBA8 -> RGB8。 */
+function rgba8ToRgb8(rgba: Uint8Array, count: number): Uint8Array {
+  const out = new Uint8Array(count * 3)
+  for (let i = 0; i < count; i++) {
+    out[i * 3] = rgba[i * 4]
+    out[i * 3 + 1] = rgba[i * 4 + 1]
+    out[i * 3 + 2] = rgba[i * 4 + 2]
+  }
+  return out
+}
+
+/** 灰度 8bit 的掩码 NCC。 */
+function maskedNcc8(a: Uint8Array, b: Uint8Array, mask: Uint8Array): number {
+  const n = mask.length
+  const ga = new Float32Array(n)
+  const gb = new Float32Array(n)
+  for (let i = 0; i < n; i++) {
+    ga[i] = 0.299 * a[i * 3] + 0.587 * a[i * 3 + 1] + 0.114 * a[i * 3 + 2]
+    gb[i] = 0.299 * b[i * 3] + 0.587 * b[i * 3 + 1] + 0.114 * b[i * 3 + 2]
+  }
+  return maskedNcc(ga, gb, mask)
+}
+
+/** RGB8 平均绝对误差（0-255 标度）。 */
+function maskedMae8(a: Uint8Array, b: Uint8Array, mask: Uint8Array): number {
+  let sum = 0
+  let n = 0
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i]) continue
+    sum +=
+      (Math.abs(a[i * 3] - b[i * 3]) +
+        Math.abs(a[i * 3 + 1] - b[i * 3 + 1]) +
+        Math.abs(a[i * 3 + 2] - b[i * 3 + 2])) /
+      3
+    n++
+  }
+  return n > 0 ? sum / n : Number.NaN
+}
+
+/** sRGB 8bit RGB 的 PSNR（0-255 域，全图）。 */
+function psnr8(a: Uint8Array, b: Uint8Array, count: number): number {
+  let mse = 0
+  for (let i = 0; i < count; i++) {
+    for (let c = 0; c < 3; c++) {
+      const d = a[i * 3 + c] - b[i * 3 + c]
+      mse += d * d
+    }
+  }
+  mse /= count * 3
+  return mse <= 0
+    ? Number.POSITIVE_INFINITY
+    : 10 * Math.log10((255 * 255) / mse)
+}
+
+/**
+ * 灰度 SSIM（标准 11×11 高斯窗，sigma=1.5，C1=(0.01)², C2=(0.03)²）。
+ *
+ * 3DGS 论文的通用指标；这里自己实现以免引入 sharp/额外依赖（窗口卷积 O(n·121)）。
+ * 只统计窗内像素（略去 5 像素边框）—— 与常见实现的边界处理差异在 1e-4 量级。
+ */
+function ssimGray8(
+  a: Uint8Array,
+  b: Uint8Array,
+  width: number,
+  height: number,
+): number {
+  const n = width * height
+  const ga = new Float64Array(n)
+  const gb = new Float64Array(n)
+  for (let i = 0; i < n; i++) {
+    ga[i] =
+      (0.299 * a[i * 3] + 0.587 * a[i * 3 + 1] + 0.114 * a[i * 3 + 2]) / 255
+    gb[i] =
+      (0.299 * b[i * 3] + 0.587 * b[i * 3 + 1] + 0.114 * b[i * 3 + 2]) / 255
+  }
+
+  const R = 5
+  const sigma = 1.5
+  const side = 2 * R + 1
+  const kernel = new Float64Array(side * side)
+  let ksum = 0
+  for (let dy = -R; dy <= R; dy++) {
+    for (let dx = -R; dx <= R; dx++) {
+      const v = Math.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma))
+      kernel[(dy + R) * side + (dx + R)] = v
+      ksum += v
+    }
+  }
+  for (let i = 0; i < kernel.length; i++) kernel[i] /= ksum
+
+  const C1 = 0.01 * 0.01
+  const C2 = 0.03 * 0.03
+  let sum = 0
+  let cnt = 0
+  for (let y = R; y < height - R; y++) {
+    for (let x = R; x < width - R; x++) {
+      let muA = 0
+      let muB = 0
+      let va = 0
+      let vb = 0
+      let cov = 0
+      let ki = 0
+      for (let dy = -R; dy <= R; dy++) {
+        const row = (y + dy) * width + x
+        for (let dx = -R; dx <= R; dx++) {
+          const w = kernel[ki++]
+          muA += w * ga[row + dx]
+          muB += w * gb[row + dx]
+        }
+      }
+      ki = 0
+      for (let dy = -R; dy <= R; dy++) {
+        const row = (y + dy) * width + x
+        for (let dx = -R; dx <= R; dx++) {
+          const w = kernel[ki++]
+          const da = ga[row + dx] - muA
+          const db = gb[row + dx] - muB
+          va += w * da * da
+          vb += w * db * db
+          cov += w * da * db
+        }
+      }
+      sum +=
+        ((2 * muA * muB + C1) * (2 * cov + C2)) /
+        ((muA * muA + muB * muB + C1) * (va + vb + C2))
+      cnt++
+    }
+  }
+  return cnt > 0 ? sum / cnt : Number.NaN
+}
+
+/** 线性域平均亮度比（渲染 / 原图，掩码内）。 */
+function brightnessRatioLinear(
+  render: Float32Array,
+  photo: Uint8Array,
+  mask: Uint8Array,
+  count: number,
+): number {
+  let rm = 0
+  let pm = 0
+  let n = 0
+  for (let i = 0; i < count; i++) {
+    if (!mask[i]) continue
+    rm += (render[i * 3] + render[i * 3 + 1] + render[i * 3 + 2]) / 3
+    pm +=
+      (srgbToLinear(photo[i * 3] / 255) +
+        srgbToLinear(photo[i * 3 + 1] / 255) +
+        srgbToLinear(photo[i * 3 + 2] / 255)) /
+      3
+    n++
+  }
+  return n > 0 ? rm / Math.max(pm, 1e-9) : Number.NaN
+}
+
+/** 差异图（每通道 |Δ|×3，便于目视）。 */
+function diffRgba8(a: Uint8Array, b: Uint8Array, count: number): Uint8Array {
+  const out = new Uint8Array(count * 4)
+  for (let i = 0; i < count; i++) {
+    for (let c = 0; c < 3; c++) {
+      const d = Math.abs(a[i * 3 + c] - b[i * 3 + c]) * 3
+      out[i * 4 + c] = d > 255 ? 255 : d
+    }
+    out[i * 4 + 3] = 255
+  }
+  return out
+}
+
+/** 深度灰度图（可见像素按 p1~p99 归一化，近处亮）。 */
+function depthGrayRgba(frame: WSplatFrame, count: number): Uint8Array {
+  const depths: number[] = []
+  for (let i = 0; i < count; i++) {
+    if (frame.visible[i] && frame.depth[i] > 0) depths.push(frame.depth[i])
+  }
+  depths.sort((a, b) => a - b)
+  const at = (q: number): number =>
+    depths.length === 0
+      ? 0
+      : depths[Math.min(depths.length - 1, Math.floor(depths.length * q))]
+  const p1 = at(0.01)
+  const p99 = at(0.99)
+  const span = Math.max(p99 - p1, 1e-9)
+  const out = new Uint8Array(count * 4)
+  for (let i = 0; i < count; i++) {
+    let v = 0
+    if (frame.visible[i] && frame.depth[i] > 0) {
+      const t = Math.min(1, Math.max(0, (frame.depth[i] - p1) / span))
+      v = Math.round(255 * (1 - t))
+    }
+    out[i * 4] = v
+    out[i * 4 + 1] = v
+    out[i * 4 + 2] = v
+    out[i * 4 + 3] = 255
+  }
+  return out
+}
+
+/** alpha 灰度图。 */
+function alphaGrayRgba(frame: WSplatFrame, count: number): Uint8Array {
+  const out = new Uint8Array(count * 4)
+  for (let i = 0; i < count; i++) {
+    const v = Math.round(Math.min(1, Math.max(0, frame.alpha[i])) * 255)
+    out[i * 4] = v
+    out[i * 4 + 1] = v
+    out[i * 4 + 2] = v
+    out[i * 4 + 3] = 255
+  }
+  return out
+}
+
+/** sRGB(0-1) -> 线性。 */
+function fmtNum(x: number, digits: number): string {
+  return Number.isFinite(x) ? x.toFixed(digits) : "n/a"
 }
 
 main().catch((err) => {

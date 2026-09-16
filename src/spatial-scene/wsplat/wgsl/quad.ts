@@ -118,7 +118,9 @@ fn fsSplat(input: SplatVarying) -> SplatFragment {
 	if (A > 1.0) {
 		discard;
 	}
-	let alpha: f32 = normExp(A) * input.gaussianColor.a;
+	var alpha: f32 = exp(-GAUSS_K2 * A) * input.gaussianColor.a;
+	// gsplat 语义：单颗高斯的逐像素 alpha 上限
+	alpha = min(alpha, MAX_ALPHA);
 	if (alpha < uniforms.alphaClipForward) {
 		discard;
 	}

@@ -42,8 +42,8 @@
  * 这正是视差渲染要的 LDI 语义：每层持有自己原本的颜色。跨层合并深度必须在
  * (ED, A) 空间做：`D_total = Σ ED_k / Σ A_k`（**不能**直接平均各层的 D）。
  * 层的最大风险是「被静默剔空」（`minPixelSize` 是像素量纲）：用 `countCulls()` /
- * `readSplatStats()` 观测剔除，用 `scripts/utils/wsplat-metrics.ts` 的 `summarizeFrame()`
- * 看层内深度跨度（跨度 = 视差平移的潜在错位量，是「该切几层」的直接判据）。
+ * `readSplatStats()` 观测剔除；层内深度跨度（跨度 = 视差平移的潜在错位量，
+ * 是「该切几层」的直接判据）可以直接从 `WSplatFrame.depth` 统计。
  *
  * ── 数据契约 ──
  * `types.ts` 是纯数据类型层（**不得** import WebGPU / node），`WSplatFrame` 的字段语义
@@ -64,11 +64,12 @@
  * ── 校验入口 ──
  * | 脚本 | 作用 |
  * |---|---|
- * | `scripts/wsplat-golden.ts` | **唯一判定入口**（阈值只存在那里，退出码非 0 = 不过门） |
- * | `scripts/wsplat-render.ts` | 只出图 + 打印数字（绝不判定，避免两处阈值漂移） |
- * | `scripts/wsplat-check-blit.ts` | 通路自检：两个累加附件 + 预乘 blend + resolve 解析解 |
- * | `scripts/wsplat-check-corner.ts` | 雅可比 y 行符号的单元测试（合成 45° 长条高斯） |
- * | `scripts/wsplat-scan-res.ts` | 分辨率扫描（像素量纲阈值 ⇒ 低分辨率的结论不能外推） |
+ * | `scripts/wsplat-check-rendering.ts` | **唯一判定入口**（阈值只在它里面，退出码非 0 = 不过门）：排序不变量 / 预乘 over 解析解 / over 方向 / 雅可比符号 / 真实场景 GPU↔CPU（NCC、MAE、深度、剔除）/ LDI 合成 |
+ * | `scripts/utils/wsplat-cpu.ts` | 参考光栅器：gsplat 前向公式的 CPU 实现（默认对齐 SHARP 的 `classic` + `eps2d=0`；与 WGSL 同尺度、同剔除） |
+ * | `scripts/utils/webgpu.ts` | node 侧 Dawn 设备（长期持有引用 + 强制 destroy） |
+ *
+ * `minPixelSize` 是像素量纲，低分辨率下的结论不能外推；把 `eps2d` 调大
+ *（如 gsplat 默认 0.3）会把极小高斯的 quad 撑过阈值，低分辨率下该项可能整项为 0。
  */
 
 import type { Gaussians3D } from "../sharp/types.ts"
@@ -142,6 +143,20 @@ export const RESOLVE_DEPTH_FORMAT: GPUTextureFormat = "rgba32float"
 /** 剔除阈值默认值：**取自上游**，不自创（见 `wgsl/chunks/gsplatCommon.ts` 的数值来源说明）。 */
 const DEFAULT_MIN_PIXEL_SIZE = 2
 const DEFAULT_ALPHA_CLIP = 1 / 255
+/**
+ * 默认渲染参数**对齐 SHARP / ml-sharp 的官方渲染口径**
+ * （`ml-sharp/src/sharp/utils/gsplat.py` 的 `GSplatRenderer.forward`）：
+ * `rasterize_mode="classic"` + `eps2d=0` —— 既不做透明度补偿，也不做低通模糊。
+ *
+ * 为什么以它为准：本渲染器服务的产物就是 SHARP（见 `sharp/` 与 `export/`）
+ * 模型输出的高斯；用与训练/官方渲染不同的 AA 只会引入系统性色偏
+ * （实测 `eps2d=0` 比 `eps2d=0.3` 更接近原图：NCC 0.9725 vs 0.9711、
+ * MAE 9.74 vs 10.07/255、亮度比 1.0023 vs 0.9983，见 [F] 段）。
+ *
+ * WGSL 的 Σ2 是 gsplat 的 4 倍，所以注入着色器时 `eps2d × 4`。
+ */
+const DEFAULT_EPS2D = 0
+const DEFAULT_ANTIALIAS = false
 
 /** 所有 `#include` 可用的 chunk。 */
 const CHUNKS: readonly WgslUnit[] = [
@@ -184,16 +199,28 @@ export interface WSplatRendererOptions {
    *
    * 它只影响协方差雅可比的第二行符号（见 `wgsl/chunks/gsplatCorner.ts` 文件头）。
    * 保留 `"up"` 是为了：(1) 与上游 playcanvas 逐行对拍，(2) 跑
-   * `scripts/wsplat-check-corner.ts` 的 A/B 验证（该测试会证明哪一个才对）。
+   * `scripts/wsplat-check-rendering.ts` 的雅可比符号 A/B 验证（[D] 段，会证明哪一个才对）。
    */
   cameraYAxis?: WSplatCameraYAxis
   /**
-   * 是否开启抗锯齿（eps2d = 0.3 + 透明度补偿）。默认 `true`。
+   * 是否开启抗锯齿的**透明度补偿**（gsplat 的 `rasterize_mode="antialiased"`）。
+   * 默认 `false` —— 对齐 SHARP / ml-sharp 的官方渲染口径（`classic`）。
    *
-   * 关掉它是为了 golden 里的「AA 对照组」：细小高斯在有 AA / 无 AA 下的稳定性差异
-   * （见 `scripts/wsplat-render.ts --compare-aa`）。
+   * ⚠ 它只控制补偿；低通模糊由 `eps2d` 单独控制，两者相互独立（gsplat 同款）。
+   * 且 `eps2d=0` 时补偿恒等于 1，此时开不开没有差别。
+   * 打开它 + `eps2d=0.3` 才是 gsplat 的 `antialiased` 口径；对照实验见
+   * `scripts/wsplat-check-rendering.ts` 的 [F] 段。
    */
   antialias?: boolean
+  /**
+   * 低通滤波的 eps2d（**gsplat 语义**：加在真像素焦距的 Σ2 上）。
+   * 默认 `0` —— 对齐 SHARP / ml-sharp 的官方渲染（`GSplatRenderer` 传 `eps2d=0`）。
+   *
+   * WGSL 的 Σ2 建在 `focal = 2·f_px` 上，所以注入着色器的是 `eps2d × 4`。
+   * gsplat 的默认值是 **0.3**（与 `rasterize_mode` 无关，无条件加到 2D 协方差）；
+   * ml-sharp 显式覆盖成 0，即不做低通模糊。要复现 gsplat 默认就显式传 `0.3`。
+   */
+  eps2d?: number
 }
 
 export interface WSplatRenderer {
@@ -407,6 +434,8 @@ class Renderer implements WSplatRenderer {
   private readonly shBands: 0 | 1 | 2 | 3
   private readonly cameraYAxis: WSplatCameraYAxis
   private readonly antialias: boolean
+  /** gsplat 语义的 eps2d（真像素焦距）；注入 WGSL 时 ×4。 */
+  private readonly eps2d: number
 
   constructor(device: GPUDevice, options: WSplatRendererOptions) {
     this.device = device
@@ -420,7 +449,8 @@ class Renderer implements WSplatRenderer {
     this.alphaClip = options.alphaClip ?? DEFAULT_ALPHA_CLIP
     this.shBands = options.shBands ?? 0
     this.cameraYAxis = options.cameraYAxis ?? "down"
-    this.antialias = options.antialias ?? true
+    this.antialias = options.antialias ?? DEFAULT_ANTIALIAS
+    this.eps2d = options.eps2d ?? DEFAULT_EPS2D
   }
 
   get width(): number {
@@ -922,6 +952,7 @@ class Renderer implements WSplatRenderer {
         SH_BANDS: this.shBands,
         GSPLAT_AA: this.antialias ? 1 : 0,
         GSPLAT_CAMERA_Y_DOWN: this.cameraYAxis === "down" ? 1 : 0,
+        GSPLAT_EPS2D: wgslEps2d(this.eps2d),
       })
       const module = createShaderModule(device, code, "splat")
       const defs = parseDefs(code)
@@ -961,6 +992,7 @@ class Renderer implements WSplatRenderer {
         SH_BANDS: this.shBands,
         GSPLAT_AA: this.antialias ? 1 : 0,
         GSPLAT_CAMERA_Y_DOWN: this.cameraYAxis === "down" ? 1 : 0,
+        GSPLAT_EPS2D: wgslEps2d(this.eps2d),
       })
       const module = createShaderModule(device, code, "cullStats")
       const defs = parseDefs(code)
@@ -1081,6 +1113,12 @@ class Renderer implements WSplatRenderer {
       texture.destroy()
     }
   }
+}
+
+/** eps2d 注入 WGSL 的字面量（WGSL 的 Σ2 是 gsplat 的 4 倍）。 */
+function wgslEps2d(eps2d: number): string {
+  const v = eps2d * 4
+  return Number.isInteger(v) ? `${v}.0` : String(v)
 }
 
 /** 预乘混合：color 与 alpha 两个通道都用 `src=one, dst=one-minus-src-alpha`。 */

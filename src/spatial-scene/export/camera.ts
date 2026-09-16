@@ -26,9 +26,9 @@
  *    注意导入器取的是图像尺寸（本 json 里的 width/height），与视口无关。
  *
  * 结论：对单图推理（extrinsics = I），位姿就是 `position=[0,0,0]`、`rotation=I`，
- * 朝向 +z；再用原始 `f_px` 与原始图像尺寸给出 fov。渲染出的画面应当与输入图逐像素对齐
- * `scripts/sharp-check-camera.ts` 核对本 json 的位姿/内参与 wsplat 相机模块是否自洽；
- * 画面级对齐证据见 `scripts/wsplat-golden.ts --compare-image`。
+ * 朝向 +z；再用原始 `f_px` 与原始图像尺寸给出 fov。渲染出的画面应当与输入图逐像素对齐。
+ * 位姿/内参与 wsplat 相机模块的自洽性由 `scripts/wsplat-check-rendering.ts` 的真实场景
+ * 那一段覆盖（它读本文档写出的 json 建 `WSplatCamera`）；与原图的画面级对齐脚本尚未迁移。
  */
 
 /** `[x, y, z]`。 */

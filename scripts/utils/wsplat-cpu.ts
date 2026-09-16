@@ -1,26 +1,31 @@
 /**
- * CPU 参考光栅器：WGSL 的**数值基准**。
+ * CPU 参考光栅器：`src/spatial-scene/wsplat` 的 WGSL 的**数值基准**。
  *
- * 这里只有**数学实现**（可复用）；判定与阈值**不在这里**，全部集中在
- * `scripts/wsplat-golden.ts`（唯一判定入口）——这样只有一个判定点，
- * 又不必把光栅化器复制一份。
- *
- * 严格按 gsplat（`rasterize_mode="antialiased"`）的前向公式，而不是照抄上游
- * playcanvas 的 quad 近似：
+ * 数学按 **gsplat 的前向公式**逐条实现（`antialiased` 的透明度补偿由 `eps2d` 驱动：
+ * `eps2d=0` 时补偿恒等于 1，等价于 `classic`）
+ * （WGSL 侧也已改成同一套语义，不再用 playcanvas 的 quad 近似）：
  *   1. 从 (四元数, 尺度) 组 3D 协方差 `Σ3 = R S² Rᵀ`
  *   2. 视图旋转 `W`（world -> camera）作用到 Σ3，再用**像素空间**雅可比
- *      `J = [[f/z, 0, -f·x/z²], [0, f/z, -f·y/z²]]`
- *   3. `Σ2 = J W Σ3 Wᵀ Jᵀ`，然后 `Σ2' = Σ2 + eps2d·I`（eps2d = 0.3，单位像素²）
- *   4. `α(p) = opacity · sqrt(det Σ2 / det Σ2') · exp(-½ · dᵀ Σ2'⁻¹ d)`
- *      其中 `d` 是像素中心相对高斯中心的偏移（单位像素）
- *   5. back-to-front（远 -> 近）做 `over` 合成，累积
+ *      `J = [[f/z, 0, -f·x/z²], [0, f/z, -f·y/z²]]`（真像素焦距 `f = f_px`）
+ *   3. `Σ2 = J W Σ3 Wᵀ Jᵀ`，然后 `Σ2' = Σ2 + eps2d·I`（默认 eps2d = 0，见下）
+ *   4. `aaFactor = sqrt(max(det Σ2 / det Σ2', MIN_COMPENSATION²))`
+ *   5. `α(p) = min(0.99, opacity · aaFactor · exp(-½ · dᵀ Σ2'⁻¹ d))`
+ *      其中 `d` 是像素中心相对高斯中心的偏移（单位像素）；低于 `alphaClip` 丢弃
+ *   6. back-to-front（远 -> 近）做 `over` 合成，累积
  *      `A`、`C_premul`、`ED = Σ T·α·z`；`D = ED / A`
  *
- * 与 WGSL 的**有意差异**（已知且可接受）：
- *   - WGSL 走「quad + normExp」：在 ~2.83σ 处把衰减归一化到 0，等价于 gsplat 的
- *     截断核但边缘略软；
- *   - WGSL 的 α 在 `alphaClipForward` 以下被丢弃。
- *   所以两边的差异应集中在高斯的边缘（golden 的 NCC 门就是为这个留的余量）。
+ * ── 与 WGSL 的一致性（尺度换算，不要改错）──
+ * WGSL 在 `focal = 2·f_px` 上建 Σ2（是本模块真像素焦距 Σ2 的 **4 倍**），所以：
+ *   - WGSL 注入的 `EPS2D`（= 本模块 `eps2d` × 4）对应本模块的 `eps2d`；
+ *   - WGSL 的 quad 像素半轴 `0.5·3.33·sqrt(λ_wgsl)` 对应本模块的 `3.33·σ_cpu`。
+ * 本模块的 `eps2d` 选项就是 **gsplat 语义的值（默认 0，对齐 SHARP/ml-sharp 官方渲染）**，
+ * 内部按 4 倍换算到 WGSL 尺度。
+ * quad 只决定光栅化的范围，核两边都是**真高斯**，所以差异只剩 f16 附件/插值的舍入。
+ *
+ * ── 剔除顺序与 `quad.ts` 的 `vsSplat` 逐条一致 ──
+ *   `原始 opacity ≤ alphaClip` -> `z ≤ eps` -> `minPixelSize` -> 视锥
+ *   -> `(AA 补偿后) alpha ≤ alphaClip` -> 绘制。
+ * `minPixelSize` / 视锥是 playcanvas 的性能剔除（gsplat 没有），保留但判据与 WGSL 相同。
  *
  * 纯 CPU、无 GPU 依赖；node 脚本专用（不进 `src/`）。
  */
@@ -46,18 +51,17 @@ export interface CpuRenderOptions {
   gaussians: Gaussians3D
   camera: CpuCamera
   /**
-   * 2D 协方差对角加项，**取上游 WGSL 的值**（默认 0.3）。
+   * 2D 协方差对角加项，**gsplat 语义的值**（真像素焦距的 Σ2 上）。
    *
-   * 注意：WGSL 的 Σ2 建在 `focal = 2·f_px` 上，是本模块 Σ2 的 4 倍，
-   * 所以内部会先除以 4 再用（见 `WGSL_COV_SCALE`）。这样 CPU 参考才与
-   * GPU 逐条一致 —— 实测该项会让 AA 后的 alphaClip 计数差 682/1.18M。
+   * 默认 `0` —— 对齐 SHARP / ml-sharp 的官方渲染（`GSplatRenderer` 传 `eps2d=0`）。
+   * gsplat 的默认值是 0.3；要复现它就显式传 0.3（此时才会算透明度补偿）。
+   * WGSL 侧的 Σ2 建在 `focal = 2·f_px` 上（4 倍），所以那边用的是 `eps2d × 4`；
+   * 本模块内部也会按 4 倍换算（见下方 `WGSL_COV_SCALE` 的一致性说明）。
    */
   eps2d?: number
   /** 低于该 α 直接跳过（对齐上游 `1/255`）。 */
   alphaClip?: number
-  /** 椭圆半轴上限（像素），防止个别巨大高斯把 CPU 参考拖死。 */
-  maxRadiusPx?: number
-  /** 与 WGSL 的 `minPixelSize` 对齐（只用于剔除统计，默认 2）。 */
+  /** 与 WGSL 的 `minPixelSize` 对齐（默认 2）。 */
   minPixelSize?: number
 }
 
@@ -83,11 +87,10 @@ export interface CpuRenderResult {
   /** 参与了合成的高斯数（通过可见性剔除与包围盒检查的实例数）。 */
   drawnSplats: number
   /**
-   * 剔除计数（诊断用，与 WGSL 的**同一套判据**）。
+   * 剔除计数（诊断用，与 WGSL 的**同一套判据与顺序**）。
    *
-   * 判据与顺序都与 `quad.ts` 的 `vsSplat` 逐条对齐（含 λ 的尺度换算），
-   * 用来与 GPU 的 `WSplatStats` 交叉验证：两边应当逐项接近（残差只来自
-   * 「CPU 用 3σ 包围盒、GPU 用 2.83σ quad」这类边界差异）。
+   * 用来与 GPU 的 `WSplatStats` 交叉验证：两边应当逐项接近
+   * （残差只来自 quad 插值与 f16 附件的舍入）。
    */
   cull: {
     total: number
@@ -101,8 +104,17 @@ export interface CpuRenderResult {
   }
 }
 
-const DEFAULT_EPS2D = 0.3
+/** gsplat 语义的 eps2d（真像素焦距尺度）；默认 0 = 对齐 SHARP/ml-sharp 官方渲染。 */
+const DEFAULT_EPS2D = 0
 const DEFAULT_ALPHA_CLIP = 1 / 255
+/** 单颗高斯的逐像素 alpha 上限（gsplat 的 MAX_ALPHA）。 */
+const MAX_ALPHA = 0.99
+/** 补偿因子下限（gsplat 的 MIN_COMPENSATION）。 */
+const MIN_COMPENSATION = 0.005
+/** quad 半轴 = GAUSS_SIGMA_RADIUS · σ（gsplat 的 radius 常数）。 */
+const GAUSS_SIGMA_RADIUS = 3.33
+/** 真高斯指数系数：α ∝ exp(-GAUSS_K2 · A)，A = r² / GAUSS_SIGMA_RADIUS²。 */
+const GAUSS_K2 = 0.5 * GAUSS_SIGMA_RADIUS * GAUSS_SIGMA_RADIUS
 
 /**
  * WGSL 的 2D 协方差相对本模块的**尺度倍数**。
@@ -110,9 +122,9 @@ const DEFAULT_ALPHA_CLIP = 1 / 255
  * `gsplatCorner.ts` 的 `focal = viewport_size.x · projMat00 = 2·f_px`
  * （上游 playcanvas 的写法，见该文件头「量纲自洽」一段），所以它的
  * `Σ2 = J Σv Jᵀ` 是本模块 `(f_px / z)` 版本的 **4 倍**。
- * 推论（实测验证过）：
- *   - WGSL 的 `eps2d = 0.3` 对应本模块尺度上的 `0.075`；
- *   - WGSL 的 `l = 2·min(sqrt(2λ), vmin)` 对应本模块的 `2·min(sqrt(8λ), vmin)`。
+ * 推论：
+ *   - WGSL 注入的 `EPS2D = eps2d × 4` 对应本模块尺度上的 `eps2d`；
+ *   - WGSL 的 quad 像素半轴 `0.5·3.33·sqrt(λ_wgsl)` 对应本模块的 `3.33·σ_cpu`。
  * 不换算就会得到「CPU 预测剔除 73.55% vs GPU 实际 46.7%」这种对不上的数。
  */
 const WGSL_COV_SCALE = 4
@@ -122,13 +134,12 @@ export function renderSplatsCpu(options: CpuRenderOptions): CpuRenderResult {
   const { gaussians, camera } = options
   const eps2d = options.eps2d ?? DEFAULT_EPS2D
   const alphaClip = options.alphaClip ?? DEFAULT_ALPHA_CLIP
-  const maxRadiusPx = options.maxRadiusPx ?? 512
 
   const count = gaussians.opacities.length
   const { width, height } = camera
   const px = width * height
 
-  // 与 WGSL 一致的 minPixelSize / vmin（`gsplatCorner.ts`）；仅诊断用
+  // 与 WGSL 一致的 minPixelSize / vmin（`gsplatCorner.ts`）
   const minPixelSize = options.minPixelSize ?? 2
   const vmin = Math.min(1024, Math.min(width, height))
   const cull = {
@@ -160,7 +171,15 @@ export function renderSplatsCpu(options: CpuRenderOptions): CpuRenderResult {
 
   for (let k = 0; k < count; k++) {
     const i = order[k]
+
+    // 1) 原始 opacity 的 alphaClip（与 `quad.ts` 同序：在剔除相机后方之前）
+    if (gaussians.opacities[i] <= alphaClip) {
+      cull.alphaClip++
+      continue
+    }
+
     const z = depths[i]
+    // 2) 相机后方 / 近零
     if (!(z > 1e-4)) {
       cull.behindCamera++
       continue
@@ -194,13 +213,13 @@ export function renderSplatsCpu(options: CpuRenderOptions): CpuRenderResult {
       [w20, w21, w22],
     ])
 
-    // ── 像素空间雅可比 ──
+    // ── 像素空间雅可比（真像素焦距）──
     const j1x = camera.fx / z
     const j1y = camera.fy / z
     const j2x = (-j1x * vx) / z
     const j2y = (-j1y * vy) / z
 
-    // Σ2 = J Σv Jᵀ（2x2），再 + eps2d·I
+    // Σ2 = J Σv Jᵀ（2x2）
     const a00 =
       j1x * cov[0][0] * j1x +
       j1x * cov[0][2] * j2x +
@@ -218,79 +237,52 @@ export function renderSplatsCpu(options: CpuRenderOptions): CpuRenderResult {
       j2y * cov[2][2] * j2y
 
     const detRaw = a00 * a11 - a01 * a01
+    // 3) 非正定（CPU 兜底，WGSL 没有这条；正常数据不触发）
     if (!(detRaw > 0)) {
       cull.nonPositiveDeterminant++
       continue
     }
-    // eps2d 的定义域是 WGSL 的 Σ2（= 本模块的 4 倍），所以要除回去。
-    // 证据：upstream playcanvas 在 `focal = viewport_size.x * projMat00`（= 2·f_px）
-    // 的协方差上硬编码 + 0.3（vert/gsplatCorner.js:52），而 gsplat 的 0.3 作用在
-    // 真像素焦距的协方差上 —— 两者差 (2f/f)² = 4 倍。
-    const eps2dLocal = eps2d / WGSL_COV_SCALE
-    const b00 = a00 + eps2dLocal
-    const b11 = a11 + eps2dLocal
+
+    // Σ2' = Σ2 + eps2d·I（gsplat 语义：eps2d 加在真像素焦距的 Σ2 上，默认 0）
+    const b00 = a00 + eps2d
+    const b11 = a11 + eps2d
     const detBlur = b00 * b11 - a01 * a01
     if (!(detBlur > 0)) continue
 
-    // ── 剔除：与 WGSL 顶点阶段逐条对齐（顺序也一致，否则计数对不上）──
-    //
-    // WGSL 的顺序（`quad.ts` 的 vsSplat + `gsplatCorner.ts`）：
-    //   原始 opacity <= alphaClip  ->  z <= eps  ->  minPixelSize  ->  视锥
-    //   ->  (AA 补偿后) alpha <= alphaClip  ->  绘制
-    // 这里的 `alphaClip`（原始 opacity）必须在 minPixelSize **之前**判，
-    // 否则同一批高斯在两边会被归到不同的原因里（实测差 ~0.4%）。
-    if (gaussians.opacities[i] <= alphaClip) {
-      cull.alphaClip++
+    // WGSL 尺度的 Σ2'（4 倍）：quad 半轴 / minPixelSize 用
+    const d1 = b00 * WGSL_COV_SCALE
+    const off2 = a01 * WGSL_COV_SCALE
+    const d2 = b11 * WGSL_COV_SCALE
+    const mid2 = 0.5 * (d1 + d2)
+    const rad2 = Math.hypot((d1 - d2) / 2, off2)
+    const lam1 = mid2 + rad2
+    const lam2 = Math.max(mid2 - rad2, 0.1)
+    // 像素半轴 = min(3.33σ, vmin)（与 WGSL 的 0.5·3.33·sqrt(λ_wgsl) 等价）
+    const pixelRadius1 = Math.min(
+      0.5 * GAUSS_SIGMA_RADIUS * Math.sqrt(lam1),
+      vmin,
+    )
+    const pixelRadius2 = Math.min(
+      0.5 * GAUSS_SIGMA_RADIUS * Math.sqrt(lam2),
+      vmin,
+    )
+    const l1 = 2 * pixelRadius1
+    const l2 = 2 * pixelRadius2
+
+    // 4) minPixelSize（与 WGSL 同式：max(l1,l2) < minPixelSize）
+    if (Math.max(l1, l2) < minPixelSize) {
+      cull.minPixelSize++
       continue
     }
 
-    // minPixelSize：按 WGSL 同式（注意 λ 要换算到 WGSL 的尺度，见 WGSL_COV_SCALE）
-    {
-      const d1 = a00 * WGSL_COV_SCALE + eps2d
-      const off2 = a01 * WGSL_COV_SCALE
-      const d2 = a11 * WGSL_COV_SCALE + eps2d
-      const mid2 = 0.5 * (d1 + d2)
-      const rad2 = Math.sqrt(((d1 - d2) / 2) ** 2 + off2 * off2)
-      const lam1 = mid2 + rad2
-      const lam2 = Math.max(mid2 - rad2, 0.1)
-      const L1 = 2 * Math.min(Math.sqrt(2 * lam1), vmin)
-      const L2 = 2 * Math.min(Math.sqrt(2 * lam2), vmin)
-      if (Math.max(L1, L2) < minPixelSize) {
-        cull.minPixelSize++
-        continue
-      }
-    }
+    // 椭圆主轴方向（比例不随尺度变，故直接用 WGSL 尺度）
+    const dir = normalize2(off2, lam1 - d1)
+    const perpX = dir.y
+    const perpY = -dir.x
 
-    const aaFactor = Math.sqrt(Math.max(detRaw / detBlur, 0))
-    const alpha = gaussians.opacities[i] * aaFactor
-    if (alpha <= alphaClip) {
-      cull.alphaClipAfterAa++
-      continue
-    }
-
-    // 椭圆范围：3σ 主轴（CPU 自己的核，比 GPU 的 2.83σ quad 略宽，尾部差 ~1% 能量）
-    const mid = 0.5 * (b00 + b11)
-    const rad = Math.sqrt(max0((b00 - b11) / 2) ** 2 + a01 * a01)
-    const lambda1 = mid + rad
-    const lambda2 = Math.max(mid - rad, 1e-6)
-    const r1 = Math.min(3 * Math.sqrt(lambda1), maxRadiusPx)
-    const r2 = Math.min(3 * Math.sqrt(lambda2), maxRadiusPx)
-
-    // 逆协方差（conic）
-    const inv = 1 / detBlur
-    const c00 = b11 * inv
-    const c01 = -a01 * inv
-    const c11 = b00 * inv
-
-    // 保守包围盒：主轴方向 + 3σ 的轴向投影
-    const diagVec = normalize2(a01, lambda1 - b00)
-    const v1x = r1 * diagVec.x
-    const v1y = r1 * diagVec.y
-    const v2x = -r2 * diagVec.y
-    const v2y = r2 * diagVec.x
-    const extX = Math.abs(v1x) + Math.abs(v2x)
-    const extY = Math.abs(v1y) + Math.abs(v2y)
-
+    // 5) 视锥剔除：quad 的轴对齐包围盒
+    const extX = Math.abs(pixelRadius1 * dir.x) + Math.abs(pixelRadius2 * perpX)
+    const extY = Math.abs(pixelRadius1 * dir.y) + Math.abs(pixelRadius2 * perpY)
     const x0 = Math.max(0, Math.floor(u - extX))
     const x1 = Math.min(width - 1, Math.ceil(u + extX))
     const y0 = Math.max(0, Math.floor(v - extY))
@@ -300,31 +292,40 @@ export function renderSplatsCpu(options: CpuRenderOptions): CpuRenderResult {
       continue
     }
 
+    // 6) AA 补偿后的 alphaClip（与 WGSL 同序：在视锥之后）
+    const aaFactor = Math.sqrt(
+      Math.max(detRaw / detBlur, MIN_COMPENSATION * MIN_COMPENSATION),
+    )
+    const alpha = gaussians.opacities[i] * aaFactor
+    if (alpha <= alphaClip) {
+      cull.alphaClipAfterAa++
+      continue
+    }
+
     drawn++
     cull.drawn++
     const cr = gaussians.colors[i * 3]
     const cg = gaussians.colors[i * 3 + 1]
     const cb = gaussians.colors[i * 3 + 2]
 
+    const invR1Sq = 1 / (pixelRadius1 * pixelRadius1)
+    const invR2Sq = 1 / (pixelRadius2 * pixelRadius2)
+
     for (let y = y0; y <= y1; y++) {
       const dy = y + 0.5 - v
       const rowBase = y * width
       for (let x = x0; x <= x1; x++) {
         const dx = x + 0.5 - u
-        const power = c00 * dx * dx + 2 * c01 * dx * dy + c11 * dy * dy
-        if (power > 0.5 * 3 * 3 * 2) continue
-        const a = alpha * Math.exp(-0.5 * power)
+        // quad 参数 A = r² / 3.33²：du 沿主轴（半轴 pixelRadius1），dv 沿副轴
+        const du = dx * dir.x + dy * dir.y
+        const dv = dx * perpX + dy * perpY
+        const A = du * du * invR1Sq + dv * dv * invR2Sq
+        if (A > 1) continue
+        // 真高斯 α = opacity·aaFactor·exp(-½ r²)
+        let a = alpha * Math.exp(-GAUSS_K2 * A)
+        if (a > MAX_ALPHA) a = MAX_ALPHA
         if (a < alphaClip) continue
         const idx = rowBase + x
-        const t = 1 - alphaAcc[idx]
-        // 该像素剩余透射率：本 splat 的贡献是 a，按「后画的更近」的 over 规则，
-        // 已累积的是更近的层，所以更新为
-        //   C = C + (1 - A_existing_partial) ... 见下
-        // 直接按 over：dst = src + dst*(1 - src.a)，src = (c*a, a)
-        // 但我们是 back-to-front 顺序累加，等价于 dst 是已画的更远层，
-        // 故这里写成 C_new = c*a + C_old*(1-a) —— 注意这会让「更远」的层被
-        // 之后（更近）的层弱化，方向正确。
-        void t
         const k3 = idx * 3
         colorAcc[k3] = cr * a + colorAcc[k3] * (1 - a)
         colorAcc[k3 + 1] = cg * a + colorAcc[k3 + 1] * (1 - a)
@@ -467,10 +468,6 @@ function covariance3toView(
     }
   }
   return tmpCov
-}
-
-function max0(x: number): number {
-  return x > 0 ? x : 0
 }
 
 /**
