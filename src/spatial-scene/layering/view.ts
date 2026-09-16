@@ -21,11 +21,14 @@
  * 两者差 `view.pixelScale`，`referenceRect` 就是用这个尺度算出来的。
  */
 
+import { INTERNAL_RESOLUTION } from "../sharp/types.ts"
 import { createWSplatCamera, type WSplatCamera } from "../wsplat/camera.ts"
 import {
   DEFAULT_MAX_RENDER_SIDE,
+  DEFAULT_SHORT_SIDE,
   DEFAULT_VIEW_SCALE,
   type LayerView,
+  type ShortSideOption,
 } from "./types.ts"
 
 /** 参考视角的最小描述（像素焦距 + 图像尺寸）。 */
@@ -43,9 +46,17 @@ export interface LayerViewOptions {
    * `> 1` 扩视角（参考内容内嵌中心，四周是原视角外的新内容）；`< 1` 裁中心。
    */
   readonly viewScale?: number
-  /** 渲染像素倍率（相对参考图像素）。默认 1。 */
+  /** 在短边定尺的基础上再乘的像素倍率。默认 1。 */
   readonly renderScale?: number
-  /** 渲染最长边上限（像素）。默认 1024；`<= 0` 关闭上限。 */
+  /**
+   * 渲染画布**短边**目标（像素）或 `"auto"`。默认 `"auto"`。
+   *
+   * `"auto"` = `min(1536（SHARP 内部分辨率）, 参考图短边)`：把参考内容的短边
+   * 渲染到这么多像素上，不超过模型能分辨的分辨率，也不超过原图本身。
+   * 因为短边定尺，长边由宽高比决定（极端全景图需要 `maxRenderSide` 兜底）。
+   */
+  readonly shortSide?: ShortSideOption
+  /** 渲染最长边**硬上限**（像素）；`0` = 关闭。默认 0。 */
   readonly maxRenderSide?: number
 }
 
@@ -69,12 +80,27 @@ export function resolveLayerView(
   if (!(viewScale > 0) || !Number.isFinite(viewScale)) {
     throw new Error(`viewScale 必须为正，收到 ${viewScale}`)
   }
-  let pixelScale = options.renderScale ?? 1
-  if (!(pixelScale > 0) || !Number.isFinite(pixelScale)) {
-    throw new Error(`renderScale 必须为正，收到 ${pixelScale}`)
+  const renderScale = options.renderScale ?? 1
+  if (!(renderScale > 0) || !Number.isFinite(renderScale)) {
+    throw new Error(`renderScale 必须为正，收到 ${renderScale}`)
   }
-  const maxRenderSide = options.maxRenderSide ?? DEFAULT_MAX_RENDER_SIDE
 
+  // 短边定尺：参考内容的短边要落在 `targetShort` 像素上。
+  const refShort = Math.min(refW, refH)
+  const shortOption = options.shortSide ?? DEFAULT_SHORT_SIDE
+  const targetShort =
+    shortOption === "auto"
+      ? Math.min(INTERNAL_RESOLUTION, refShort)
+      : shortOption
+  if (!(targetShort > 0) || !Number.isFinite(targetShort)) {
+    throw new Error(
+      `shortSide 必须为正数或 "auto"，收到 ${String(shortOption)}`,
+    )
+  }
+  let pixelScale = (targetShort / refShort) * renderScale
+
+  // 长边硬上限（可选）：短边定尺后长边可能很长（全景图），这里兜底。
+  const maxRenderSide = options.maxRenderSide ?? DEFAULT_MAX_RENDER_SIDE
   if (maxRenderSide > 0) {
     const longest = Math.max(refW, refH) * viewScale * pixelScale
     if (longest > maxRenderSide) pixelScale *= maxRenderSide / longest

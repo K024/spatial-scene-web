@@ -71,10 +71,12 @@ export type {
   LayerView,
   LayerViewRect,
   NdcDepth,
+  ShortSideOption,
 } from "./types.ts"
 export {
   DEFAULT_LAYERS,
   DEFAULT_MAX_RENDER_SIDE,
+  DEFAULT_SHORT_SIDE,
   DEFAULT_VIEW_SCALE,
   MAX_LAYERS,
   MAX_RECOMMENDED_LAYERS,

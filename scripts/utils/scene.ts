@@ -53,9 +53,13 @@ export interface LoadSceneOptions {
   readonly far?: number
 }
 
-export interface LoadedScene {
+export interface LoadedScene extends GaussiansScene {
   readonly plyPath: string
   readonly cameraPath: string
+}
+
+/** 从高斯场装配出的场景（PLY / 推理两条输入路径共用）。 */
+export interface GaussiansScene {
   readonly gaussians: Gaussians3D
   /** **参考视角**相机（原图分辨率 / 原图像素焦距）。 */
   readonly camera: WSplatCamera
@@ -65,6 +69,61 @@ export interface LoadedScene {
   readonly far: number
   /** 视图空间 z 的分位数（日志用）。 */
   readonly depthQuantiles: { p01: number; median: number; p99: number }
+}
+
+/**
+ * 由**已经在内存里的**高斯场 + 相机参数装配场景。
+ *
+ * 与 `loadWSplatScene` 里那段完全相同，抽出来是为了让「图 -> 推理 -> 分层 -> GLB」
+ * 这条路径不必先导出 PLY 再读回来。
+ *
+ * near/far 默认由视图 z 的 1%/99% 分位推（相机朝 +z，与朝向无关）。
+ */
+export function buildSceneFromGaussians(args: {
+  readonly gaussians: Gaussians3D
+  readonly focalLengthPx: number
+  readonly width: number
+  readonly height: number
+  readonly position?: readonly [number, number, number]
+  readonly rotation?: readonly [
+    readonly [number, number, number],
+    readonly [number, number, number],
+    readonly [number, number, number],
+  ]
+  readonly near?: number
+  readonly far?: number
+}): GaussiansScene {
+  const { gaussians, focalLengthPx, width, height } = args
+  const count = gaussians.opacities.length
+  if (count === 0) throw new Error("buildSceneFromGaussians: 高斯数为 0")
+
+  const zs = new Float32Array(count)
+  for (let i = 0; i < count; i++) zs[i] = gaussians.meanVectors[i * 3 + 2]
+  zs.sort()
+  const at = (q: number): number =>
+    zs[Math.min(count - 1, Math.max(0, Math.floor(count * q)))]
+  const p01 = at(0.01)
+  const median = at(0.5)
+  const p99 = at(0.99)
+  const near = args.near ?? Math.max(0.01, p01 * 0.5)
+  const far = args.far ?? Math.max(near * 4, p99 * 2)
+
+  const camera = createWSplatCamera({
+    intrinsics: { focalLengthPx, width, height },
+    position: args.position ?? [0, 0, 0],
+    rotation: args.rotation,
+    near,
+    far,
+  })
+
+  return {
+    gaussians,
+    camera,
+    focalLengthPx,
+    near,
+    far,
+    depthQuantiles: { p01, median, p99 },
+  }
 }
 
 /**
@@ -157,37 +216,18 @@ export function loadWSplatScene(options: LoadSceneOptions = {}): LoadedScene {
   }
   const width = pose.width
   const height = pose.height
-
-  // near/far 由点云视图 z 的 1%/99% 分位推（相机朝 +z，与朝向无关）。
-  const zs = new Float32Array(count)
-  for (let i = 0; i < count; i++) zs[i] = gaussians.meanVectors[i * 3 + 2]
-  zs.sort()
-  const at = (q: number): number =>
-    zs[Math.min(count - 1, Math.max(0, Math.floor(count * q)))]
-  const p01 = at(0.01)
-  const median = at(0.5)
-  const p99 = at(0.99)
-  const near = options.near ?? Math.max(0.01, p01 * 0.5)
-  const far = options.far ?? Math.max(near * 4, p99 * 2)
-
-  const camera = createWSplatCamera({
-    intrinsics: { focalLengthPx: pose.fx, width, height },
-    position: pose.position ?? [0, 0, 0],
+  const scene = buildSceneFromGaussians({
+    gaussians,
+    focalLengthPx: pose.fx,
+    width,
+    height,
+    position: pose.position,
     rotation: pose.rotation,
-    near,
-    far,
+    near: options.near,
+    far: options.far,
   })
 
-  return {
-    plyPath,
-    cameraPath,
-    gaussians,
-    camera,
-    focalLengthPx: pose.fx,
-    near,
-    far,
-    depthQuantiles: { p01, median, p99 },
-  }
+  return { plyPath, cameraPath, ...scene }
 }
 
 /** 直通线性 RGB + α -> sRGB RGBA8（α=0 置黑），供 PNG 预览。 */

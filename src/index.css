@@ -1,111 +1,253 @@
-:root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+@import "tailwindcss";
 
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
+/* FlyonUI（基于 daisyUI 语义类）：只取它两个纯 CSS 组件 ——
+   `loading loading-spinner`（加载浮层）与 `progress`（进度条）。
+   其余控件（滑杆/开关/按钮/分段）保持自定义：它们承载的是玻璃质感这套
+   视觉语言，套 daisy 主题的实色风格反而会互相打架；需要时再逐个替换即可。 */
+@plugin "flyonui" {
+  themes: dark --default;
+}
+@source "../node_modules/flyonui/dist/index.js";
 
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+/* ==========================================================================
+   设计令牌
+   ========================================================================== */
 
-  @media (max-width: 1024px) {
-    font-size: 16px;
-  }
+@theme {
+  /* 品牌强调色：冷青色（「空间/深度」的语感），与暖色警告区分 */
+  --color-accent-50: #ecfeff;
+  --color-accent-200: #a5f3fc;
+  --color-accent-400: #22d3ee;
+  --color-accent-500: #06b6d4;
+  --color-accent-600: #0891b2;
+
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", "Noto Sans SC", "PingFang SC", "Microsoft YaHei",
+    sans-serif;
+  --font-mono:
+    ui-monospace, "SF Mono", "JetBrains Mono", Consolas, "Liberation Mono",
+    monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
-  }
+/* ==========================================================================
+   基础
+   ========================================================================== */
 
-  #social .button-icon {
-    filter: invert(1) brightness(2);
-  }
-}
-
+html,
+body,
 #root {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
-  min-height: 100svh;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
+  height: 100%;
+  margin: 0;
 }
 
 body {
-  margin: 0;
+  /* 画布之外露出的部分（安全区、过扫描）也保持深色，避免白边闪烁 */
+  background: #05060a;
+  color: #e5e7eb;
+  font-family: var(--font-sans);
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
+:root {
+  color-scheme: dark;
 }
 
-h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
+/* 数字一律等宽对齐：统计面板里数字跳动时不会左右晃 */
+.tnum {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* ==========================================================================
+   玻璃质感
+   ========================================================================== */
+
+/* 面板主体：半透明黑 + 强背景模糊 + 细描边 + 内外两层阴影 */
+.glass {
+  background: color-mix(in srgb, #05070c 62%, transparent);
+  backdrop-filter: blur(28px) saturate(160%);
+  -webkit-backdrop-filter: blur(28px) saturate(160%);
+  border: 1px solid rgb(255 255 255 / 0.09);
+  box-shadow:
+    0 1px 0 0 rgb(255 255 255 / 0.06) inset,
+    0 24px 60px -12px rgb(0 0 0 / 0.7);
+}
+
+/* 更轻的一层：给顶栏/提示条这类小元素用 */
+.glass-soft {
+  background: color-mix(in srgb, #05070c 48%, transparent);
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  border: 1px solid rgb(255 255 255 / 0.08);
+  box-shadow: 0 10px 30px -14px rgb(0 0 0 / 0.65);
+}
+
+/* 面板内分隔线（上缘带一点高光，像蚀刻） */
+.hairline {
+  border-top: 1px solid rgb(255 255 255 / 0.07);
+  box-shadow: 0 -1px 0 0 rgb(255 255 255 / 0.02);
+}
+
+/* 细分隔（列表行之间） */
+.hairline-x {
+  border-top: 1px solid rgb(255 255 255 / 0.05);
+}
+
+/* 滚动条：只在悬停时显形，弱化存在感。
+   必须显式写 `overflow-x: hidden`：`overflow-y: auto` 会把 `overflow-x`
+   从 visible 强制变成 auto，于是任何超宽内容（比如一长串 GPU 型号）
+   都会给面板加一条横向滚动条。 */
+.scroll-slim {
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: rgb(255 255 255 / 0.16) transparent;
+}
+.scroll-slim::-webkit-scrollbar {
+  width: 8px;
+  height: 0;
+}
+.scroll-slim::-webkit-scrollbar-thumb {
+  background: rgb(255 255 255 / 0.14);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+.scroll-slim::-webkit-scrollbar-thumb:hover {
+  background: rgb(255 255 255 / 0.26);
+  background-clip: content-box;
+}
+.scroll-slim::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ==========================================================================
+   控件
+   ========================================================================== */
+
+/* 滑杆：轨道是细线，滑块是小圆点，hover 时放大 */
+.range {
+  appearance: none;
+  width: 100%;
+  height: 18px;
+  background: transparent;
+  cursor: ew-resize;
+}
+.range::-webkit-slider-runnable-track {
+  height: 2px;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.14);
+}
+.range::-moz-range-track {
+  height: 2px;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.14);
+}
+.range::-webkit-slider-thumb {
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  margin-top: -5px;
+  border-radius: 999px;
+  background: #e7fbff;
+  border: 1px solid rgb(6 182 212 / 0.9);
+  box-shadow: 0 0 0 3px rgb(6 182 212 / 0.16);
+  transition: transform 120ms ease;
+}
+.range:hover::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+.range:active::-webkit-slider-thumb {
+  transform: scale(1.25);
+}
+.range::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: #e7fbff;
+  border: 1px solid rgb(6 182 212 / 0.9);
+  box-shadow: 0 0 0 3px rgb(6 182 212 / 0.16);
+}
+.range:focus-visible {
+  outline: none;
+}
+.range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 4px rgb(6 182 212 / 0.35);
+}
+
+/* 色板输入：抹掉浏览器默认的边框，留一个圆角方块 */
+.swatch {
+  appearance: none;
+  padding: 0;
+  border: 1px solid rgb(255 255 255 / 0.16);
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+.swatch::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+.swatch::-webkit-color-swatch {
+  border: none;
+  border-radius: 6px;
+}
+.swatch::-moz-color-swatch {
+  border: none;
+  border-radius: 6px;
+}
+
+/* 焦点环统一 */
+.focus-ring:focus-visible {
+  outline: 2px solid rgb(34 211 238 / 0.7);
+  outline-offset: 2px;
+}
+
+/* ==========================================================================
+   动效
+   ========================================================================== */
+
+@keyframes sheen {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
   }
 }
-h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
-  margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
+
+/* 进度条上的流光 */
+.progress-sheen::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgb(255 255 255 / 0.45),
+    transparent
+  );
+  animation: sheen 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-sheen::after {
+    animation: none;
   }
 }
-p {
-  margin: 0;
-}
 
-code,
-.counter {
-  font-family: var(--mono);
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
+/* 画布上的取景提示：仅在自由模式显示「可拖拽」光标 ——
+   视差/自动模式下拖拽不改变姿态，给抓取光标会误导。 */
+.stage {
+  touch-action: none;
 }
-
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
+.stage[data-mode="free"] {
+  cursor: grab;
+}
+.stage[data-mode="free"][data-dragging="true"] {
+  cursor: grabbing;
 }

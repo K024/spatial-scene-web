@@ -20,7 +20,7 @@
  *
  * 用法:
  *   npx tsx scripts/layering-check.ts
- *   npx tsx scripts/layering-check.ts --layers 10 --view-scale 1.2 --max-side 1024
+ *   npx tsx scripts/layering-check.ts --layers 10 --view-scale 1.2 --short-side auto
  *   npx tsx scripts/layering-check.ts --no-visual          # 不出图
  *   npx tsx scripts/layering-check.ts --max-splats 200000  # 调试：只用 N 个高斯
  */
@@ -35,6 +35,8 @@ import {
   compositeLayerFrames,
   computeLayerPlacement,
   DEFAULT_LAYERS,
+  DEFAULT_MAX_RENDER_SIDE,
+  DEFAULT_SHORT_SIDE,
   type LayerPlacement,
   ndcDepthFromZ,
   permuteNdcDepths,
@@ -45,7 +47,7 @@ import {
   zFromNdcDepth,
 } from "../src/spatial-scene/layering/index.ts"
 import { computeViewDepths } from "../src/spatial-scene/wsplat/sort.ts"
-import { numFlag, REPO_ROOT } from "./utils/common.ts"
+import { numFlag, REPO_ROOT, shortSideFlag } from "./utils/common.ts"
 import { rgbaToPngBuffer } from "./utils/image.ts"
 import { linearFrameToRgba8, loadWSplatScene } from "./utils/scene.ts"
 import { withNodeDevice } from "./utils/webgpu.ts"
@@ -67,6 +69,7 @@ const CLI = {
   "view-scale": { type: "string" },
   "render-scale": { type: "string" },
   "max-side": { type: "string" },
+  "short-side": { type: "string" },
   "range-overlap": { type: "string" },
   "min-pixel-size": { type: "string" },
   ply: { type: "string" },
@@ -95,7 +98,17 @@ async function main(): Promise<void> {
   )
   const viewScale = numFlag("--view-scale", args.values["view-scale"], 1.2)
   const renderScale = numFlag("--render-scale", args.values["render-scale"], 1)
-  const maxSide = numFlag("--max-side", args.values["max-side"], 1024)
+  // 分辨率默认「短边 auto」：min(SHARP 内部 1536, 原图短边)；--max-side 只作长边硬上限。
+  const shortSide = shortSideFlag(
+    "--short-side",
+    args.values["short-side"],
+    DEFAULT_SHORT_SIDE,
+  )
+  const maxSide = numFlag(
+    "--max-side",
+    args.values["max-side"],
+    DEFAULT_MAX_RENDER_SIDE,
+  )
   const rangeOverlap = numFlag(
     "--range-overlap",
     args.values["range-overlap"],
@@ -133,6 +146,7 @@ async function main(): Promise<void> {
       layers,
       viewScale,
       renderScale,
+      shortSide,
       maxRenderSide: maxSide,
       rangeOverlap,
       minPixelSize: args.values["min-pixel-size"]
@@ -398,14 +412,16 @@ function bandsChecks(L: number): void {
 
 function viewChecks(): void {
   const reference = { width: 3024, height: 2268, focalLengthPx: 2620.958 }
-  const view = resolveLayerView(reference, {
-    viewScale: 1.2,
-    renderScale: 1,
-    maxRenderSide: 1024,
-  })
-  const longest = Math.max(view.width, view.height)
+  // 短边 auto = min(1536, 原图短边)；参考内容短边应正好落在这个像素数上。
+  const view = resolveLayerView(reference, { viewScale: 1.2 })
   const rect = view.referenceRect
-  // 参考矩形必须与画布同心、同尺度（焦距关系），且长边不超上限。
+  const expectedShort = Math.min(
+    1536,
+    Math.min(reference.width, reference.height),
+  )
+  const refShort = Math.min(rect.width, rect.height)
+  const shortOk = Math.abs(refShort - expectedShort) < 1e-6
+  // 参考矩形必须与画布同心、同尺度（焦距关系），且不超出画布。
   const scaleFromRect = rect.width / reference.width
   const sameScale = Math.abs(scaleFromRect - view.pixelScale) < 1e-9
   const focalOk =
@@ -417,9 +433,9 @@ function viewChecks(): void {
   const withinCanvas =
     rect.width <= view.width + 1 && rect.height <= view.height + 1
   addCheck(
-    "视图（尺度/居中/上限）",
-    sameScale && focalOk && centered && withinCanvas && longest <= 1024,
-    `${view.width}x${view.height}  pixelScale=${view.pixelScale.toFixed(4)}  fx=${view.focalLengthPx.toFixed(1)}px  长边=${longest}`,
+    "视图（短边定尺/居中）",
+    sameScale && focalOk && centered && withinCanvas && shortOk,
+    `${view.width}x${view.height}  参考短边=${refShort.toFixed(1)}px（目标 ${expectedShort}）  pixelScale=${view.pixelScale.toFixed(4)}  fx=${view.focalLengthPx.toFixed(1)}px`,
   )
 }
 

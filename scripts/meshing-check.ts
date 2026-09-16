@@ -1,34 +1,41 @@
 /**
- * meshing 自检 + 导出（layered RGBAD -> mesh -> **GLB**）。
+ * meshing 自检（**唯一判定入口**：阈值只在本文件里，退出码非 0 = 不过门）。
  *
  * 阶段：`src/spatial-scene/meshing/**`（分层 RGBAD -> 渲染器无关的 mesh 场景）。
  *
  * ── 跑什么 ──
  *   [A] 分层渲染（复用 layering）。
- *   [B] 网格结构门：索引在界内 / 顶点有限 / UV 在 `[0,1]` / 逐层非空。
- *   [C] 几何 ↔ 帧一致性：抽样顶点的**相机空间 z** 必须等于该 UV 处帧的深度
+ *   [B] 网格化。
+ *   [C] 网格结构门：索引在界内 / 顶点有限 / UV 在 `[0,1]` / 逐层非空。
+ *   [D] 几何 ↔ 帧一致性：抽样顶点的**相机空间 z** 必须等于该 UV 处帧的深度
  *       （贴边外推的顶点深度来自最近 seed，所以看的是分位数而不是最大值）。
- *   [D] GLB 自检：容器头 / chunk / JSON / accessor 计数 / 写盘。
- *   [E] 视觉（仅观测）：把 mesh 顶点按渲染相机投到画布上出 PNG（几何覆盖检查）。
+ *   [E] mesh 光栅化 ↔ splat 直渲（粗门）。
+ *   [F] GLB 自检：**在内存里** `buildGlb()`，验容器 / JSON / accessor / 往返字节，
+ *       **不写盘** —— 出交付产物是 `scripts/export-glb.ts` 的事。
+ *   [G] 视觉（仅观测）：把 mesh 顶点投到画布上出 PNG（几何覆盖检查）。
  *
  * 用法:
- *   npx tsx scripts/meshing-export.ts
- *   npx tsx scripts/meshing-export.ts --layers 10 --min-cell 4 --max-error 0.005
- *   npx tsx scripts/meshing-export.ts --pixel            # 逐像素出面（对照基线）
- *   npx tsx scripts/meshing-export.ts --no-glb           # 只跑门，不写文件
+ *   npx tsx scripts/meshing-check.ts
+ *   npx tsx scripts/meshing-check.ts --layers 10 --min-cell 4 --max-error 0.005
+ *   npx tsx scripts/meshing-check.ts --pixel          # 逐像素出面（对照基线）
+ *   npx tsx scripts/meshing-check.ts --no-visual      # 不出图
  */
 
 import { mkdirSync, writeFileSync } from "node:fs"
-import { dirname, resolve } from "node:path"
+import { resolve } from "node:path"
 import { parseArgs } from "node:util"
 
-import { renderLayerStack } from "../src/spatial-scene/layering/index.ts"
+import {
+  DEFAULT_MAX_RENDER_SIDE,
+  DEFAULT_SHORT_SIDE,
+  renderLayerStack,
+} from "../src/spatial-scene/layering/index.ts"
 import {
   buildGlb,
   buildMeshScene,
   type MeshScene,
 } from "../src/spatial-scene/meshing/index.ts"
-import { humanSize, numFlag, REPO_ROOT } from "./utils/common.ts"
+import { humanSize, numFlag, REPO_ROOT, shortSideFlag } from "./utils/common.ts"
 import { decodeImageToRgba, rgbaToPngBuffer } from "./utils/image.ts"
 import { type RasterResult, rasterizeMeshScene } from "./utils/raster.ts"
 import { linearFrameToRgba8, loadWSplatScene } from "./utils/scene.ts"
@@ -48,6 +55,7 @@ const CLI = {
   layers: { type: "string" },
   "view-scale": { type: "string" },
   "max-side": { type: "string" },
+  "short-side": { type: "string" },
   "min-cell": { type: "string" },
   "max-error": { type: "string" },
   "max-cell": { type: "string" },
@@ -59,9 +67,7 @@ const CLI = {
   ply: { type: "string" },
   camera: { type: "string" },
   "max-splats": { type: "string" },
-  out: { type: "string" },
   "visual-out": { type: "string" },
-  "no-glb": { type: "boolean" },
   "no-visual": { type: "boolean" },
 } as const
 
@@ -81,20 +87,25 @@ async function main(): Promise<void> {
   })
   const layers = Math.round(numFlag("--layers", args.values.layers, 10))
   const viewScale = numFlag("--view-scale", args.values["view-scale"], 1.2)
-  const maxSide = numFlag("--max-side", args.values["max-side"], 1024)
-  const outPath = resolve(
-    REPO_ROOT,
-    args.values.out ?? "public/exports/layered.glb",
+  // 分辨率默认「短边 auto」：min(SHARP 内部 1536, 原图短边)；--max-side 只作长边硬上限。
+  const shortSide = shortSideFlag(
+    "--short-side",
+    args.values["short-side"],
+    DEFAULT_SHORT_SIDE,
   )
-  const outDir = dirname(outPath)
+  const maxSide = numFlag(
+    "--max-side",
+    args.values["max-side"],
+    DEFAULT_MAX_RENDER_SIDE,
+  )
   // 调试图不进 `public/`（那里只放交付产物）。
   const visualDir = resolve(
     REPO_ROOT,
-    args.values["visual-out"] ?? "temp/meshing-export",
+    args.values["visual-out"] ?? "temp/meshing-check",
   )
 
   console.log("=".repeat(78))
-  console.log("meshing 自检 + 导出")
+  console.log("meshing 自检")
   console.log("=".repeat(78))
 
   const scene = loadWSplatScene({
@@ -118,6 +129,7 @@ async function main(): Promise<void> {
       camera: scene.camera,
       layers,
       viewScale,
+      shortSide,
       maxRenderSide: maxSide,
       includeDirect: true,
     })
@@ -172,21 +184,18 @@ async function main(): Promise<void> {
 
   if (!meshScene) throw new Error("网格化没有产出")
 
-  console.log("\n[F] GLB")
-  if (args.values["no-glb"] === true) {
-    console.log("  --no-glb：跳过")
-  } else {
+  console.log("\n[F] GLB（内存构建，不写盘）")
+  {
     const t2 = Date.now()
     const glb = buildGlb(meshScene, {
       name: "spatial-scene",
       doubleSided: true,
     })
-    mkdirSync(outDir, { recursive: true })
-    writeFileSync(outPath, glb)
     glbChecks(glb)
     await glbRoundTrip(glb, meshScene)
     console.log(
-      `      写出 ${outPath}  ${humanSize(glb.byteLength)}  ${Date.now() - t2}ms`,
+      `      ${humanSize(glb.byteLength)}  ${Date.now() - t2}ms  ` +
+        `（交付产物用 npm run export-glb 生成）`,
     )
   }
 
@@ -622,6 +631,6 @@ async function writeCoverage(
 }
 
 main().catch((err) => {
-  console.error(`\n导出失败: ${err instanceof Error ? err.stack : err}`)
+  console.error(`\n自检失败: ${err instanceof Error ? err.stack : err}`)
   process.exitCode = 1
 })

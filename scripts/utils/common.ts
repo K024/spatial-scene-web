@@ -13,6 +13,8 @@
 import { existsSync, statSync } from "node:fs"
 import { resolve } from "node:path"
 
+import type { ShortSideOption } from "../../src/spatial-scene/layering/types.ts"
+
 /** 仓库根目录（本文件位于 scripts/utils/ 下，向上两级）。 */
 export const REPO_ROOT = resolve(import.meta.dirname, "..", "..")
 
@@ -110,6 +112,25 @@ export function numFlag(
   const value = Number(raw)
   if (!Number.isFinite(value)) {
     throw new Error(`${flag} 需要一个数字（收到 "${raw}"）`)
+  }
+  return value
+}
+
+/**
+ * 解析「短边分辨率」flag：`auto` 字面量或正数像素。
+ *
+ * `auto` = `min(1536（SHARP 内部分辨率）, 原图短边)`（在 `resolveLayerView` 里算）。
+ */
+export function shortSideFlag(
+  flag: string,
+  raw: string | undefined,
+  fallback: ShortSideOption,
+): ShortSideOption {
+  if (raw === undefined) return fallback
+  if (raw === "auto") return "auto"
+  const value = Number(raw)
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${flag} 需要 "auto" 或一个正数（收到 "${raw}"）`)
   }
   return value
 }

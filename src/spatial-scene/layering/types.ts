@@ -197,7 +197,18 @@ export interface LayerRenderOptions {
   readonly viewScale?: number
   /** 渲染像素倍率（相对参考图像素）。默认 1。 */
   readonly renderScale?: number
-  /** 渲染最长边上限（像素）。默认 1024；`<= 0` 关闭上限。 */
+  /**
+   * 渲染画布的**短边**目标（像素）或 `"auto"`。默认 `"auto"`。
+   *
+   * `"auto"` = `min(1536（SHARP 内部分辨率）, 参考图短边)` —— 即「参考内容在
+   * 渲染画布里的短边像素数」不超过模型能分辨的分辨率，也不超过原图本身。
+   * 短边定尺 → 像素焦距 `fx = 原图 fx · (目标短边 / 原图短边)`；画布 = 参考内容 × `viewScale`。
+   */
+  readonly shortSide?: ShortSideOption
+  /**
+   * 渲染最长边**硬上限**（像素）。默认 `0` = 关闭。
+   * 短边定尺后长边由宽高比决定，极端全景图才需要它兜底。
+   */
   readonly maxRenderSide?: number
   /** `[L*2]` 层范围的视差余量（只写进 `ranges` 元数据，不影响划分）。默认 0。 */
   readonly rangeOverlap?: number
@@ -224,5 +235,12 @@ export const MAX_RECOMMENDED_LAYERS = 16
 export const MAX_LAYERS = 64
 /** 默认视角扩倍率。 */
 export const DEFAULT_VIEW_SCALE = 1.2
-/** 默认渲染最长边（像素）。 */
-export const DEFAULT_MAX_RENDER_SIDE = 1024
+
+/** 渲染短边目标：像素数或 `"auto"`。 */
+export type ShortSideOption = number | "auto"
+
+/** 默认短边目标：`auto` = `min(1536（SHARP 内部分辨率）, 参考图短边)`。 */
+export const DEFAULT_SHORT_SIDE: ShortSideOption = "auto"
+
+/** 默认渲染最长边硬上限（像素）；`0` = 关闭。 */
+export const DEFAULT_MAX_RENDER_SIDE = 0

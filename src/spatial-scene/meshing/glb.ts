@@ -311,6 +311,10 @@ function buildGltfJson(args: {
         scene.view.referenceRect.width,
         scene.view.referenceRect.height,
       ],
+      // 参考相机的位姿（glTF 系）。当前链路 `extrinsics = I`，所以是「原点、朝 −Z」；
+      // 显式写出来，查看器就不必依赖「节点没有 transform 即单位阵」这条隐含约定。
+      position: [0, 0, 0],
+      rotation: [0, 0, 0, 1],
     },
     layerOrder: order.map(({ index }) => layerName(index)),
     skippedLayers: scene.layers
