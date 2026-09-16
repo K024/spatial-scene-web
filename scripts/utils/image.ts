@@ -119,6 +119,35 @@ export async function rgbaToPngBuffer(
   return sharpFromRgba(rgba, width, height).png().toBuffer()
 }
 
+/** PNG/JPEG 字节 -> RGBA8 裸像素（自写 PNG 编码器的解码验证用）。 */
+export async function decodeImageToRgba(
+  bytes: Uint8Array,
+): Promise<{ data: Uint8Array; width: number; height: number }> {
+  interface Decoder {
+    ensureAlpha(): Decoder
+    raw(): Decoder
+    toBuffer(opts: { resolveWithObject: true }): Promise<{
+      data: Buffer
+      info: { width: number; height: number; channels: number }
+    }>
+  }
+  const factory = require("sharp") as (input: Buffer) => Decoder
+  const { data, info } = await factory(
+    Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+  )
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true })
+  if (info.channels !== 4) {
+    throw new Error(`decodeImageToRgba: 期望 4 通道，收到 ${info.channels}`)
+  }
+  return {
+    data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+    width: info.width,
+    height: info.height,
+  }
+}
+
 /** 已加载的图像 + 元数据。 */
 export interface LoadedImage {
   /** HWC RGB uint8 像素。 */

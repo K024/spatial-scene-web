@@ -9,7 +9,9 @@
     "lint": "tsc -b && biome check .",
     "format": "biome format --write .",
     "preview": "vite preview",
-    "sample": "tsx scripts/export-ply.ts"
+    "sample": "tsx scripts/export-ply.ts",
+    "layering": "tsx scripts/layering-check.ts",
+    "meshing": "tsx scripts/meshing-export.ts"
   },
   "dependencies": {
     "@preact/signals-react": "^3.12.0",
