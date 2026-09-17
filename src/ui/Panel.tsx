@@ -30,6 +30,7 @@ import {
   layerOpacity,
   loadGlb,
   loadGlbFromFile,
+  msaa,
   panelOpen,
   parallaxAmplitude,
   poseDeviationDeg,
@@ -65,6 +66,7 @@ import {
   Segmented,
   Slider,
   Stat,
+  Toggle,
 } from "./primitives.tsx"
 
 const BACKGROUND_PRESETS: { label: string; value: string }[] = [
@@ -86,6 +88,7 @@ export function Panel() {
     background: background.useValue(),
     grid: showGrid.useValue(),
     gizmo: showGizmo.useValue(),
+    msaa: msaa.useValue(),
     opacity: layerOpacity.useValue(),
     wireframe: wireframe.useValue(),
     doubleSided: doubleSided.useValue(),
@@ -302,6 +305,14 @@ export function Panel() {
                   layerOpacity.value = x
                 }}
                 format={(x) => `${Math.round(x * 100)}%`}
+              />
+              <Toggle
+                label="MSAA"
+                checked={v.msaa}
+                hint="切换会重建 WebGL 上下文"
+                onChange={(checked) => {
+                  msaa.value = checked
+                }}
               />
             </Section>
 

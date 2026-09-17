@@ -30,8 +30,9 @@
  * `referenceRect / layerDepths / layerRanges` 等 -> `scene.extras`。
  *
  * ── 纹理为什么在这里编码 ──
- * glTF 只认 PNG/JPEG；`png.ts` 是自带的 stored-deflate 编码器（零依赖、平台无关）。
- * 「暂不做体积优化」是本阶段的明确取舍 —— 要缩体积时换掉 `encodeTexture` 即可。
+ * `buildGlb` 保留 PNG 同步路径，供纯 CPU / 无 WASM 环境使用；
+ * `buildGlbAsync` 默认输出 KTX2/BasisUniversal，浏览器与 Node 共用同一个 WASM
+ * 编码器接口。KTX2 走 `KHR_texture_basisu`，仍保持 unlit + BLEND 语义。
  */
 
 import { encodePngRgba8 } from "./png.ts"
@@ -45,13 +46,23 @@ export interface GlbExportOptions {
   readonly doubleSided?: boolean
   /** 纹理是否编码成 sRGB（glTF `baseColorTexture` 约定）。默认 `true`。 */
   readonly srgbTextures?: boolean
+  /**
+   * 纹理格式。`buildGlb` 只支持 `"png"`；`buildGlbAsync` 默认 `"ktx2"`。
+   */
+  readonly textureFormat?: "png" | "ktx2"
+  /** KTX2 编码模式。默认 `"etc1s"`；UASTC 质量更高、体积更大。 */
+  readonly textureEncoding?: "etc1s" | "uastc"
+  /** ETC1S 质量，范围 1..255。默认 180。 */
+  readonly textureQuality?: number
 }
 
 /** glTF 组件类型常量。 */
 const FLOAT = 5126
+const UNSIGNED_SHORT = 5123
 const UNSIGNED_INT = 5125
 const ARRAY_BUFFER = 34962
 const ELEMENT_ARRAY_BUFFER = 34963
+const DEFAULT_KTX2_QUALITY = 180
 
 /**
  * `MeshScene` -> GLB 字节（纯函数）。
@@ -63,11 +74,54 @@ export function buildGlb(
   scene: MeshScene,
   options: GlbExportOptions = {},
 ): Uint8Array {
-  const doubleSided = options.doubleSided ?? true
+  if (options.textureFormat === "ktx2") {
+    throw new Error("KTX2 编码是异步的；请使用 buildGlbAsync()")
+  }
   const srgb = options.srgbTextures ?? true
+  const baked = scene.layers.map((layer) => {
+    const texture = encodePngTexture(layer.texture, srgb)
+    return {
+      ...bakeGeometry(layer, texture.uvScale),
+      texture,
+    }
+  })
+  return assembleGlb(scene, baked, options)
+}
 
-  // ── 1. 逐层烘焙 ──
-  const baked = scene.layers.map((layer) => bakeLayer(layer, srgb))
+/**
+ * `MeshScene` -> GLB 字节，默认使用 KTX2/BasisUniversal。
+ *
+ * 编码器通过动态 import 选择当前平台的 `ktx2-encoder` 导出：Node 使用本地 WASM，
+ * 浏览器使用同一包内带的浏览器 WASM。纹理编码串行执行，避免十层 RGBA 同时占用
+ * 大块 WASM 堆内存。
+ */
+export async function buildGlbAsync(
+  scene: MeshScene,
+  options: GlbExportOptions = {},
+): Promise<Uint8Array> {
+  const srgb = options.srgbTextures ?? true
+  const textureFormat = options.textureFormat ?? "ktx2"
+  const baked: BakedLayer[] = []
+  for (const layer of scene.layers) {
+    const texture =
+      textureFormat === "ktx2"
+        ? await encodeKtx2Texture(layer.texture, srgb, options)
+        : encodePngTexture(layer.texture, srgb)
+    baked.push({
+      ...bakeGeometry(layer, texture.uvScale),
+      texture,
+    })
+  }
+  return assembleGlb(scene, baked, options)
+}
+
+function assembleGlb(
+  scene: MeshScene,
+  baked: BakedLayer[],
+  options: GlbExportOptions,
+): Uint8Array {
+  const doubleSided = options.doubleSided ?? true
+
   // 渲染顺序默认值：远 -> 近（three 的透明排序在等距时按 id 递增）。
   const order = baked
     .map((b, index) => ({ b, index }))
@@ -78,9 +132,9 @@ export function buildGlb(
   const binary = new BinaryWriter()
   const layout = order.map(({ b }) => ({
     position: binary.alignTo4().writeFloat32(b.positions),
-    uv: binary.alignTo4().writeFloat32(b.uvs),
-    index: binary.alignTo4().writeUint32(b.indices),
-    image: binary.alignTo4().writeBytes(b.png),
+    uv: binary.alignTo4().writeBytes(b.uvs),
+    index: binary.alignTo4().writeBytes(b.indices),
+    image: binary.alignTo4().writeBytes(b.texture.bytes),
   }))
   const bin = binary.finish()
 
@@ -100,14 +154,25 @@ export function buildGlb(
 
 interface BakedLayer {
   readonly positions: Float32Array
-  readonly uvs: Float32Array
-  readonly indices: Uint32Array
-  readonly png: Uint8Array
+  readonly uvs: Uint16Array
+  readonly indices: Uint16Array | Uint32Array
+  readonly indexComponentType: typeof UNSIGNED_SHORT | typeof UNSIGNED_INT
+  readonly texture: EncodedTexture
   readonly layer: LayerMesh
 }
 
-/** 位置 bake + 绕序反转 + 纹理编码。 */
-function bakeLayer(layer: LayerMesh, srgb: boolean): BakedLayer {
+interface EncodedTexture {
+  readonly bytes: Uint8Array
+  readonly mimeType: "image/png" | "image/ktx2"
+  readonly basisu: boolean
+  readonly uvScale: readonly [number, number]
+}
+
+/** 位置 bake + 绕序反转 + UV / index 量化。 */
+function bakeGeometry(
+  layer: LayerMesh,
+  uvScale: readonly [number, number],
+): Omit<BakedLayer, "texture"> {
   const positions = new Float32Array(layer.positions.length)
   for (let i = 0; i < layer.vertexCount; i++) {
     positions[i * 3] = layer.positions[i * 3]
@@ -121,13 +186,27 @@ function bakeLayer(layer: LayerMesh, srgb: boolean): BakedLayer {
     indices[t + 1] = layer.indices[t + 2]
     indices[t + 2] = layer.indices[t + 1]
   }
+  const compactIndices =
+    layer.vertexCount <= 0xffff ? toUint16(indices) : indices
+  const uvs = new Uint16Array(layer.uvs.length)
+  for (let i = 0; i < layer.uvs.length; i++) {
+    const scale = i % 2 === 0 ? uvScale[0] : uvScale[1]
+    uvs[i] = Math.round(clamp01(layer.uvs[i]) * scale * 0xffff)
+  }
   return {
     positions,
-    uvs: layer.uvs,
-    indices,
-    png: encodeTexture(layer.texture, srgb),
+    uvs,
+    indices: compactIndices,
+    indexComponentType:
+      compactIndices instanceof Uint16Array ? UNSIGNED_SHORT : UNSIGNED_INT,
     layer,
   }
+}
+
+function toUint16(values: Uint32Array): Uint16Array {
+  const out = new Uint16Array(values.length)
+  for (let i = 0; i < values.length; i++) out[i] = values[i]
+  return out
 }
 
 /**
@@ -136,13 +215,76 @@ function bakeLayer(layer: LayerMesh, srgb: boolean): BakedLayer {
  * `alpha == 0` 的像素 RGB 置黑：`resolve` 的直通色在 α→0 时是 `premult/α`，
  * 数值上有噪声，而 mip / 双线性会把它混进可见像素。
  */
-function encodeTexture(texture: RgbaTexture, srgb: boolean): Uint8Array {
+function encodePngTexture(texture: RgbaTexture, srgb: boolean): EncodedTexture {
+  return {
+    bytes: encodePngRgba8(
+      textureToRgba8(texture, srgb),
+      texture.width,
+      texture.height,
+    ),
+    mimeType: "image/png",
+    basisu: false,
+    uvScale: [1, 1],
+  }
+}
+
+async function encodeKtx2Texture(
+  texture: RgbaTexture,
+  srgb: boolean,
+  options: GlbExportOptions,
+): Promise<EncodedTexture> {
+  const { encodeToKTX2 } = await import("ktx2-encoder")
+  const quality = Math.max(
+    1,
+    Math.min(255, Math.round(options.textureQuality ?? DEFAULT_KTX2_QUALITY)),
+  )
+  const isUASTC = options.textureEncoding === "uastc"
+  const width = align4(texture.width)
+  const height = align4(texture.height)
+  const bytes = await encodeToKTX2(
+    textureToRgba8(texture, srgb, width, height),
+    {
+      enableDebug: false,
+      isKTX2File: true,
+      isUASTC,
+      needSupercompression: true,
+      generateMipmap: true,
+      isYFlip: false,
+      isPerceptual: srgb,
+      isSetKTX2SRGBTransferFunc: srgb,
+      qualityLevel: quality,
+      uastcLDRQualityLevel: 2,
+      enableRDO: isUASTC,
+      rdoQualityLevel: 1.5,
+      imageDecoder: async (buffer) => ({
+        width,
+        height,
+        data: buffer,
+      }),
+    },
+  )
+  return {
+    bytes,
+    mimeType: "image/ktx2",
+    basisu: true,
+    uvScale: [texture.width / width, texture.height / height],
+  }
+}
+
+function textureToRgba8(
+  texture: RgbaTexture,
+  srgb: boolean,
+  width = texture.width,
+  height = texture.height,
+): Uint8Array {
   const pixels = texture.width * texture.height
-  const rgba = new Uint8Array(pixels * 4)
+  const rgba = new Uint8Array(width * height * 4)
   const { rgb, alpha } = texture
   for (let i = 0; i < pixels; i++) {
     const a = clamp01(alpha[i])
-    const o = i * 4
+    const x = i % texture.width
+    const y = Math.floor(i / texture.width)
+    const o = (y * width + x) * 4
     if (a <= 0) {
       rgba[o + 3] = 0
       continue
@@ -153,7 +295,11 @@ function encodeTexture(texture: RgbaTexture, srgb: boolean): Uint8Array {
     }
     rgba[o + 3] = Math.round(a * 255)
   }
-  return encodePngRgba8(rgba, texture.width, texture.height)
+  return rgba
+}
+
+function align4(value: number): number {
+  return Math.ceil(value / 4) * 4
 }
 
 /** 单值线性 -> sRGB（与 `sharp/colorspace.ts: linearRGB2sRGB` 同式）。 */
@@ -232,14 +378,15 @@ function buildGltfJson(args: {
     const uvAccessor = accessors.length
     accessors.push({
       bufferView: uvView,
-      componentType: FLOAT,
+      componentType: UNSIGNED_SHORT,
       count: b.layer.vertexCount,
       type: "VEC2",
+      normalized: true,
     })
     const indexAccessor = accessors.length
     accessors.push({
       bufferView: indexView,
-      componentType: UNSIGNED_INT,
+      componentType: b.indexComponentType,
       count: b.indices.length,
       type: "SCALAR",
     })
@@ -247,10 +394,19 @@ function buildGltfJson(args: {
     images.push({
       name: `${name}_baseColor`,
       bufferView: imageView,
-      mimeType: "image/png",
+      mimeType: b.texture.mimeType,
     })
     const textureIndex = textures.length
-    textures.push({ source: textureIndex, sampler: 0 })
+    textures.push(
+      b.texture.basisu
+        ? {
+            sampler: 0,
+            extensions: {
+              KHR_texture_basisu: { source: textureIndex },
+            },
+          }
+        : { source: textureIndex, sampler: 0 },
+    )
 
     const materialIndex = materials.length
     materials.push({
@@ -328,7 +484,15 @@ function buildGltfJson(args: {
       version: "2.0",
       generator: GENERATOR,
     },
-    extensionsUsed: ["KHR_materials_unlit"],
+    extensionsUsed: [
+      "KHR_materials_unlit",
+      ...(order.some(({ b }) => b.texture.basisu)
+        ? ["KHR_texture_basisu"]
+        : []),
+    ],
+    ...(order.some(({ b }) => b.texture.basisu)
+      ? { extensionsRequired: ["KHR_texture_basisu"] }
+      : {}),
     scene: 0,
     scenes: [
       {
@@ -399,9 +563,14 @@ class BinaryWriter {
     return this
   }
 
-  writeBytes(bytes: Uint8Array): { byteOffset: number; byteLength: number } {
+  writeBytes(bytes: ArrayBufferView): {
+    byteOffset: number
+    byteLength: number
+  } {
     const byteOffset = this.length
-    this.chunks.push(bytes)
+    this.chunks.push(
+      new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+    )
     this.length += bytes.byteLength
     return { byteOffset, byteLength: bytes.byteLength }
   }

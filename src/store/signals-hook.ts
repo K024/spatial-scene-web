@@ -27,10 +27,12 @@ if (!Object.hasOwn(Signal.prototype, "useValue")) {
     writable: true,
     value: function useValue<T>(this: Signal<T>): T {
       const signal = this
+      // biome-ignore lint/correctness/useExhaustiveDependencies: this
       const subscribe = useCallback(
         (onStoreChange: () => void) => signal.subscribe(onStoreChange),
         [signal],
       )
+      // biome-ignore lint/correctness/useExhaustiveDependencies: this
       const getSnapshot = useCallback(() => signal.peek(), [signal])
       return useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
     },

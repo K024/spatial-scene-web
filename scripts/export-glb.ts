@@ -27,6 +27,8 @@
  *   npx tsx scripts/export-glb.ts --image photo.jpg --limit 200000  # 调试：只用前 N 个高斯
  *   npx tsx scripts/export-glb.ts --image photo.jpg --short-side 1024
  *   npx tsx scripts/export-glb.ts --image pano.jpg --max-side 2048   # 全景图：长边硬上限
+ *   npx tsx scripts/export-glb.ts --texture-format png              # 退回未压缩 PNG
+ *   npx tsx scripts/export-glb.ts --texture-encoding uastc          # 更高质量 KTX2
  *
  * 分辨率：默认 `--short-side auto` = `min(1536（SHARP 内部分辨率）, 原图短边)` ——
  * 把参考内容的短边渲染到这么多像素上（长边由宽高比决定，可用 `--max-side` 兜底）。
@@ -47,7 +49,7 @@ import {
   renderLayerStack,
 } from "../src/spatial-scene/layering/index.ts"
 import {
-  buildGlb,
+  buildGlbAsync,
   buildMeshScene,
   type MeshScene,
 } from "../src/spatial-scene/meshing/index.ts"
@@ -101,6 +103,9 @@ const CLI = {
   dilate: { type: "string" },
   "alpha-cutoff": { type: "string" },
   "min-island": { type: "string" },
+  "texture-format": { type: "string" },
+  "texture-encoding": { type: "string" },
+  "texture-quality": { type: "string" },
   pixel: { type: "boolean" },
   "no-double-sided": { type: "boolean" },
   out: { type: "string" },
@@ -130,6 +135,19 @@ async function main(): Promise<void> {
     REPO_ROOT,
     args.values.out ?? "public/exports/layered.glb",
   )
+  const textureFormat = args.values["texture-format"] ?? "ktx2"
+  if (textureFormat !== "ktx2" && textureFormat !== "png") {
+    throw new Error(`未知 --texture-format "${textureFormat}"，可选 ktx2 | png`)
+  }
+  const textureEncoding = args.values["texture-encoding"] ?? "etc1s"
+  if (textureEncoding !== "etc1s" && textureEncoding !== "uastc") {
+    throw new Error(
+      `未知 --texture-encoding "${textureEncoding}"，可选 etc1s | uastc`,
+    )
+  }
+  const textureQuality = args.values["texture-quality"]
+    ? numFlag("--texture-quality", args.values["texture-quality"], 180)
+    : undefined
 
   console.log("=".repeat(78))
   console.log("导出 GLB")
@@ -202,9 +220,19 @@ async function main(): Promise<void> {
   if (!meshScene) throw new Error("网格化没有产出")
 
   const t2 = Date.now()
-  const glb = buildGlb(meshScene, {
+  if (textureFormat === "ktx2") {
+    console.log(
+      `\nKTX2 编码 ${meshScene.layers.length} 层（${textureEncoding}${
+        textureEncoding === "etc1s" ? ` q=${textureQuality ?? 180}` : ""
+      }）...`,
+    )
+  }
+  const glb = await buildGlbAsync(meshScene, {
     name: "spatial-scene",
     doubleSided: args.values["no-double-sided"] !== true,
+    textureFormat,
+    textureEncoding,
+    textureQuality,
   })
   mkdirSync(dirname(outPath), { recursive: true })
   writeFileSync(outPath, glb)
@@ -223,7 +251,11 @@ async function main(): Promise<void> {
       `referenceRect=[${rect.x.toFixed(1)}, ${rect.y.toFixed(1)}, ${rect.width.toFixed(1)}, ${rect.height.toFixed(1)}]`,
   )
   console.log(
-    `\n写出 ${outPath}  ${humanSize(glb.byteLength)}  ${Date.now() - t2}ms`,
+    `\n纹理  ${textureFormat}${textureFormat === "ktx2" ? `/${textureEncoding}` : ""}` +
+      `${textureFormat === "ktx2" && textureEncoding === "etc1s" ? ` q=${textureQuality ?? 180}` : ""}`,
+  )
+  console.log(
+    `写出 ${outPath}  ${humanSize(glb.byteLength)}  ${Date.now() - t2}ms`,
   )
 }
 

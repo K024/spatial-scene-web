@@ -15,6 +15,8 @@ export const background = signal("#0a0b10")
 export const showGrid = signal(true)
 /** 坐标轴 gizmo（drei GizmoHelper）。 */
 export const showGizmo = signal(true)
+/** WebGL MSAA。上下文创建时固定，切换会重建 Canvas。默认关闭。 */
+export const msaa = signal(false)
 
 /** 全部图层的整体不透明度倍率。 */
 export const layerOpacity = signal(1)

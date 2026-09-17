@@ -19,6 +19,8 @@ import "./signals-hook.ts"
 import { signal } from "@preact/signals-react"
 import * as THREE from "three"
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js"
+import { KTX2Loader } from "three/examples/jsm/loaders/KTX2Loader.js"
+import { createKTX2Loader } from "./ktx2.ts"
 
 /** 默认产物路径（与 `scripts/export-glb.ts` 的默认 `--out` 一致）。 */
 export const DEFAULT_GLB_URL = "/exports/layered.glb"
@@ -85,13 +87,34 @@ export const glbError = signal<string | null>(null)
 export const glbScene = signal<THREE.Group | null>(null)
 export const glbMeta = signal<GlbMeta | null>(null)
 
+let ktx2Loader: KTX2Loader | null = null
+
+/**
+ * 绑定当前 Canvas 的 WebGLRenderer 到 GLTFLoader。
+ *
+ * KTX2 的 GPU 格式支持与 WebGL 上下文相关，所以不能在 store 里提前构造。
+ * 返回清理函数：MSAA 切换会重建 Canvas，旧 KTX2Loader 的 worker 必须同步释放。
+ */
+export function configureGltfRuntime(
+  renderer: THREE.WebGLRenderer,
+): () => void {
+  const next = createKTX2Loader(renderer)
+  const previous = ktx2Loader
+  ktx2Loader = next
+  previous?.dispose()
+  return () => {
+    if (ktx2Loader === next) ktx2Loader = null
+    next.dispose()
+  }
+}
+
 /** 载入默认产物（或显式 URL）。换文件会替换当前场景并释放旧的 GPU 资源。 */
 export async function loadGlb(url: string = DEFAULT_GLB_URL): Promise<void> {
   if (glbStatus.peek() === "loading") return
   glbStatus.value = "loading"
   glbError.value = null
   try {
-    const loader = new GLTFLoader()
+    const loader = createGltfLoader()
     const [gltf, bytes] = await Promise.all([
       loader.loadAsync(url),
       fetchByteLength(url),
@@ -116,13 +139,19 @@ export async function loadGlbFromFile(file: File): Promise<void> {
   glbError.value = null
   try {
     const buffer = await file.arrayBuffer()
-    const gltf = await new GLTFLoader().parseAsync(buffer, "")
+    const gltf = await createGltfLoader().parseAsync(buffer, "")
     commit(gltf.scene, gltf.cameras, file.name, buffer.byteLength)
     glbSource.value = { kind: "file", label: file.name, url: null }
   } catch (err) {
     glbStatus.value = "error"
     glbError.value = err instanceof Error ? err.message : String(err)
   }
+}
+
+function createGltfLoader(): GLTFLoader {
+  const loader = new GLTFLoader()
+  if (ktx2Loader) loader.setKTX2Loader(ktx2Loader)
+  return loader
 }
 
 /** 把刚载入的场景接上（先换新、再释放旧）。 */

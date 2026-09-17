@@ -15,7 +15,7 @@
  */
 
 import { GizmoHelper, GizmoViewport, Grid } from "@react-three/drei"
-import { Canvas, invalidate } from "@react-three/fiber"
+import { Canvas, invalidate, useThree } from "@react-three/fiber"
 import { useEffect, useMemo, useRef } from "react"
 import * as THREE from "three"
 import {
@@ -23,6 +23,7 @@ import {
   autoPeriod,
   background,
   cameraMode,
+  configureGltfRuntime,
   dolly,
   doubleSided,
   easingMs,
@@ -30,9 +31,12 @@ import {
   type GlbMeta,
   glbMeta,
   glbScene,
+  glbStatus,
   inputSensitivity,
   isolateLayer,
   layerOpacity,
+  loadGlb,
+  msaa,
   orbit,
   parallaxAmplitude,
   resetCamera,
@@ -61,6 +65,7 @@ export function Viewer3D() {
   const grid = showGrid.useValue()
   const gizmo = showGizmo.useValue()
   const mode = cameraMode.useValue()
+  const msaaEnabled = msaa.useValue()
 
   const wrapperRef = useRef<HTMLDivElement>(null)
   const drag = useRef<{ id: number; x: number; y: number } | null>(null)
@@ -148,15 +153,17 @@ export function Viewer3D() {
       }}
     >
       <Canvas
+        key={msaaEnabled ? "msaa" : "no-msaa"}
         flat
         // 空闲不画：由输入/信号 `invalidate()` 与 `CameraDriver` 的缓动续帧驱动。
         frameloop="demand"
         dpr={[1, 2]}
-        gl={{ antialias: true, powerPreference: "high-performance" }}
+        gl={{ antialias: msaaEnabled, powerPreference: "high-performance" }}
         camera={{ position: [0, 0, 0], fov: 50, near: 0.005, far: 5000 }}
       >
         <color attach="background" args={[bg]} />
 
+        <GltfRuntime />
         {scene ? <primitive object={scene} dispose={null} /> : null}
         <LayerToggles meta={meta} />
         <CameraParamWatcher />
@@ -182,6 +189,23 @@ export function Viewer3D() {
       </Canvas>
     </div>
   )
+}
+
+/** 把当前 WebGLRenderer 接到 GLTFLoader；初始 GLB 也等运行时就绪后再加载。 */
+function GltfRuntime() {
+  const gl = useThree((state) => state.gl)
+  useEffect(() => {
+    const dispose = configureGltfRuntime(gl)
+    // StrictMode 会先 cleanup 再重跑 effect；延后到本轮布局稳定后再启动首包。
+    const id = window.setTimeout(() => {
+      if (glbStatus.peek() === "idle") void loadGlb()
+    }, 0)
+    return () => {
+      window.clearTimeout(id)
+      dispose()
+    }
+  }, [gl])
+  return null
 }
 
 /**
